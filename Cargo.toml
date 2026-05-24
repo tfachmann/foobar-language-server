@@ -1,6 +1,32 @@
 [package]
-name = "language-server-foobar"
+name = "foobar-language-server"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
+tower-lsp-server = "0.23"
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "io-std",
+  "io-util",
+] }
+tree-sitter = "0.26"
+tree-sitter-foobar = { path = "../tree-sitter-foobar" }
+ropey = "1.6"
+dashmap = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+percent-encoding = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "io-util",
+  "sync",
+  "test-util",
+] }
