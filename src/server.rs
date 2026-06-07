@@ -10,13 +10,14 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_lsp_server::jsonrpc::Result as RpcResult;
 use tower_lsp_server::ls_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    MessageType, OneOf, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf, ServerCapabilities,
+    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use tower_lsp_server::{Client, LanguageServer};
 
+use crate::definition;
 use crate::diagnostics;
 use crate::document::Document;
 use crate::hover;
@@ -109,7 +110,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
-                definition_provider: Some(OneOf::Left(false)),
+                definition_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -213,6 +214,20 @@ impl LanguageServer for Backend {
         drop(entry);
         let guard = doc.read().await;
         Ok(hover::hover(&self.workspace, &guard, &params).await)
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> RpcResult<Option<GotoDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let Some(entry) = self.workspace.docs.get(uri) else {
+            return Ok(None);
+        };
+        let doc = entry.clone();
+        drop(entry);
+        let guard = doc.read().await;
+        Ok(definition::goto(&self.workspace, &guard, &params).await)
     }
 }
 

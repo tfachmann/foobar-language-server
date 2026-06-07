@@ -1,3 +1,4 @@
+mod definition;
 mod diagnostics;
 mod document;
 mod hover;
