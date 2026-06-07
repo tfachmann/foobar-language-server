@@ -102,7 +102,6 @@ async fn hover_variable_use(workspace: &Workspace, doc: &Document, name: &str) -
     };
     Some(format!(
         "**{name}** = `{value}`\n---\n{location}",
-        name = name,
         value = hit.entry.value_text,
     ))
 }
@@ -117,7 +116,6 @@ fn hover_defines_key(doc: &Document, name: &str) -> Option<String> {
     };
     Some(format!(
         "**{name}** = `{value}`  \n---\n{usage}",
-        name = name,
         value = entry.value_text,
     ))
 }
@@ -141,23 +139,20 @@ fn hover_process_entry_key(name: &str) -> Option<String> {
 async fn hover_include_path(workspace: &Workspace, doc: &Document, node: Node<'_>) -> String {
     let raw = doc.rope.node_text(node).trim().to_string();
     let resolved = workspace.resolve(&doc.uri, &raw);
-    let mut body = format!("**include** `{raw}`");
+    let mut body = format!("**include** `{raw}`\n---\n");
     match resolved {
         Some(r) => {
-            body.push_str(&format!("\n---\nResolved to `{}`", display_path(&r.path)));
+            body.push_str(&format!("Resolved to `{}`\n---\n", display_path(&r.path)));
             if !r.exists {
-                body.push_str("\n---\n_file not found_");
+                body.push_str("_file not found_");
             } else if let Some(n) = workspace.defines_count_at(&r.path).await {
-                body.push_str(&format!(
-                    "\n---\n_{n} define{}_",
-                    if n == 1 { "" } else { "s" }
-                ));
+                body.push_str(&format!("_{n} define{}_", if n == 1 { "" } else { "s" }));
             } else {
-                body.push_str("\n---\n_file found_");
+                body.push_str("_file found_");
             }
         }
         None => {
-            body.push_str("\n---\n_could not resolve path (base URI is not file://)_");
+            body.push_str("_could not resolve path (base URI is not file://)_");
         }
     }
     body
@@ -299,7 +294,7 @@ mod tests {
         );
         ws.refresh_includes_for(&main_doc).await;
 
-        // %(name) on line 3 starts at col 15 ("hi %(name)" → `n` of name)
+        // %(name) on line 3 starts at col 15 ("hi %(name)" -> `n` of name)
         let s = hover_at(&ws, &main_doc, &main_uri, 3, 15).await.unwrap();
         assert!(s.contains("**name**"), "got: {s}");
         assert!(s.contains("timo"), "got: {s}");

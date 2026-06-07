@@ -36,6 +36,8 @@ pub struct SymbolIndex {
     pub defines: HashMap<String, DefineEntry>,
     pub processes: Vec<ProcessHeader>,
     pub includes: Vec<IncludeRef>,
+    /// Every `%(name)` reference encountered.
+    pub var_refs: Vec<(String, Range)>,
 }
 
 impl SymbolIndex {
@@ -61,9 +63,10 @@ impl SymbolIndex {
             }
         }
 
-        for (name, range) in collect_refs(root, rope) {
-            if let Some(entry) = defines.get_mut(&name) {
-                entry.refs.push(range);
+        let var_refs = collect_refs(root, rope);
+        for (name, range) in &var_refs {
+            if let Some(entry) = defines.get_mut(name) {
+                entry.refs.push(*range);
             }
         }
 
@@ -71,6 +74,7 @@ impl SymbolIndex {
             defines,
             processes,
             includes,
+            var_refs,
         }
     }
 }

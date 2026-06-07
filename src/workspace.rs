@@ -13,9 +13,10 @@ use std::time::SystemTime;
 use dashmap::DashMap;
 use ropey::Rope;
 use tokio::sync::RwLock;
-use tower_lsp_server::ls_types::Uri;
+use tower_lsp_server::ls_types::{Diagnostic, Uri};
 use tree_sitter::Parser;
 
+use crate::diagnostics::collect_parse_errors;
 use crate::document::Document;
 use crate::symbol::{DefineEntry, IncludeRef, SymbolIndex};
 use crate::text::{path_to_uri, uri_to_path};
@@ -25,6 +26,8 @@ pub struct DiskFile {
     pub path: PathBuf,
     pub mtime: Option<SystemTime>,
     pub symbols: SymbolIndex,
+    /// Parse errors precomputed at load time.
+    pub parse_diags: Vec<Diagnostic>,
 }
 
 /// Where a definition was found.
@@ -52,12 +55,14 @@ pub struct ResolvedInclude {
 
 /// Workspace symbol information.
 ///
-/// Keeps track of open documents (and it's symbols)
+/// Keeps track of open documents (and it's symbols).
 pub struct Workspace {
     /// Files open in the editor (via LSP).
     pub docs: DashMap<Uri, Arc<RwLock<Document>>>,
     /// Cache of files read from disk (not currently open in the editor).
     pub disk: DashMap<PathBuf, Arc<DiskFile>>,
+    /// Remebers dependent paths.
+    pub dependents: DashMap<PathBuf, HashSet<Uri>>,
 }
 
 impl Workspace {
@@ -65,6 +70,7 @@ impl Workspace {
         Self {
             docs: DashMap::new(),
             disk: DashMap::new(),
+            dependents: DashMap::new(),
         }
     }
 
@@ -142,9 +148,42 @@ impl Workspace {
                 }
             }
         }
+
+        self.rebuild_dependents_for(&doc.uri, &visited);
     }
 
-    /// Read + parse + index a file from disk. Returns `None` on any IO/parse failure.
+    fn rebuild_dependents_for(&self, uri: &Uri, included_paths: &HashSet<PathBuf>) {
+        for mut entry in self.dependents.iter_mut() {
+            entry.value_mut().remove(uri);
+        }
+        self.dependents.retain(|_, set| !set.is_empty());
+        for path in included_paths {
+            self.dependents
+                .entry(path.clone())
+                .or_default()
+                .insert(uri.clone());
+        }
+    }
+
+    /// Drop `uri` from dependents entirely (e.g. on `did_close`).
+    pub fn forget_doc(&self, uri: &Uri) {
+        for mut entry in self.dependents.iter_mut() {
+            entry.value_mut().remove(uri);
+        }
+        self.dependents.retain(|_, set| !set.is_empty());
+    }
+
+    /// Return the set of open-doc URIs that transitively include `path`.
+    pub fn dependents_of(&self, path: &Path) -> Vec<Uri> {
+        self.dependents
+            .get(path)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Read + parse + index a file from disk.
+    ///
+    /// Returns `None` on any IO/parse failure.
     fn load_disk_file(&self, path: &Path) -> Option<DiskFile> {
         let text = fs::read_to_string(path).ok()?;
         let mut parser = Parser::new();
@@ -154,11 +193,14 @@ impl Workspace {
         let tree = parser.parse(&text, None)?;
         let rope = Rope::from_str(&text);
         let symbols = SymbolIndex::from_tree(&tree, &rope);
+        let mut parse_diags = Vec::new();
+        collect_parse_errors(&tree, &rope, &mut parse_diags);
         let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
         Some(DiskFile {
             path: path.to_path_buf(),
             mtime,
             symbols,
+            parse_diags,
         })
     }
 
@@ -221,7 +263,57 @@ impl Workspace {
         None
     }
 
+    /// Cheap variant of [`Self::lookup_define`].
+    /// Answers "does `name` resolve from this base?".
+    ///
+    /// `local` is the perspective file's own symbol index (open or disk).
+    pub async fn has_define(&self, base_uri: &Uri, local: &SymbolIndex, name: &str) -> bool {
+        if local.defines.contains_key(name) {
+            return true;
+        }
+
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        let mut queue: VecDeque<(Uri, Vec<IncludeRef>)> = VecDeque::new();
+        queue.push_back((base_uri.clone(), local.includes.clone()));
+
+        while let Some((base, includes)) = queue.pop_front() {
+            for inc in includes {
+                let Some(resolved) = self.resolve(&base, &inc.raw_path) else {
+                    continue;
+                };
+                if !visited.insert(resolved.path.clone()) {
+                    continue;
+                }
+                if !resolved.exists {
+                    continue;
+                }
+
+                if let Some(open_uri) = self.find_open_doc(&resolved.path) {
+                    if let Some(open_doc) = self.docs.get(&open_uri) {
+                        let guard = open_doc.read().await;
+                        if guard.symbols.defines.contains_key(name) {
+                            return true;
+                        }
+                        queue.push_back((guard.uri.clone(), guard.symbols.includes.clone()));
+                        continue;
+                    }
+                }
+
+                if let Some(file) = self.disk.get(&resolved.path) {
+                    if file.symbols.defines.contains_key(name) {
+                        return true;
+                    }
+                    let next_base = path_to_uri(&resolved.path).unwrap_or_else(|| base.clone());
+                    queue.push_back((next_base, file.symbols.includes.clone()));
+                }
+            }
+        }
+
+        false
+    }
+
     /// Count defines in a resolved include target (looking at open doc first, then disk).
+    ///
     /// Returns `None` if the file isn't loaded (neither open nor cached).
     pub async fn defines_count_at(&self, path: &Path) -> Option<usize> {
         if let Some(open_uri) = self.find_open_doc(path) {
@@ -363,5 +455,62 @@ mod tests {
         let hit = ws.lookup_define(&main_doc, "name").await.unwrap();
         assert_eq!(hit.entry.value_text, "buffer");
         assert!(matches!(hit.source, DefineSource::OpenDoc(_)));
+    }
+
+    #[tokio::test]
+    async fn rebuild_dependents_basic() {
+        let ws = Workspace::new();
+        let dir = TempDir::new().unwrap();
+        let inc_path = dir.path().join("inc.foobar");
+        let main_path = dir.path().join("main.foobar");
+        fs::write(&inc_path, "defines\nx: \"1\"\n").unwrap();
+        let main_text = "include inc.foobar\n";
+        fs::write(&main_path, main_text).unwrap();
+        let main_uri = path_to_uri(&main_path).unwrap();
+        let main_doc = open_doc(main_uri.clone(), main_text);
+
+        ws.refresh_includes_for(&main_doc).await;
+        let inc_canon = inc_path.canonicalize().unwrap();
+        let deps = ws.dependents_of(&inc_canon);
+        assert_eq!(deps, vec![main_uri]);
+    }
+
+    #[tokio::test]
+    async fn rebuild_dependents_remove_on_reparse() {
+        let ws = Workspace::new();
+        let dir = TempDir::new().unwrap();
+        let inc_path = dir.path().join("inc.foobar");
+        let main_path = dir.path().join("main.foobar");
+        fs::write(&inc_path, "defines\nx: \"1\"\n").unwrap();
+        let main_uri = path_to_uri(&main_path).unwrap();
+
+        // First version includes inc.foobar
+        let v1 = open_doc(main_uri.clone(), "include inc.foobar\n");
+        ws.refresh_includes_for(&v1).await;
+        let inc_canon = inc_path.canonicalize().unwrap();
+        assert_eq!(ws.dependents_of(&inc_canon), vec![main_uri.clone()]);
+
+        // Second version drops the include
+        let v2 = open_doc(main_uri.clone(), "defines\ny: \"2\"\n");
+        ws.refresh_includes_for(&v2).await;
+        assert!(ws.dependents_of(&inc_canon).is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_doc_clears_entries() {
+        let ws = Workspace::new();
+        let dir = TempDir::new().unwrap();
+        let inc_path = dir.path().join("inc.foobar");
+        let main_path = dir.path().join("main.foobar");
+        fs::write(&inc_path, "defines\nx: \"1\"\n").unwrap();
+        let main_uri = path_to_uri(&main_path).unwrap();
+        let doc = open_doc(main_uri.clone(), "include inc.foobar\n");
+
+        ws.refresh_includes_for(&doc).await;
+        let inc_canon = inc_path.canonicalize().unwrap();
+        assert_eq!(ws.dependents_of(&inc_canon), vec![main_uri.clone()]);
+
+        ws.forget_doc(&main_uri);
+        assert!(ws.dependents_of(&inc_canon).is_empty());
     }
 }

@@ -1,3 +1,4 @@
+mod diagnostics;
 mod document;
 mod hover;
 mod keywords;
