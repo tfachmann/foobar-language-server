@@ -1,5 +1,7 @@
 //! tower-lsp-server [`Backend`]: stores docs, delegates feature impls.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,39 +57,52 @@ impl Backend {
     }
 
     /// Cancel any pending diagnostics publish for `uri` and schedule a fresh one.
-    ///
-    /// Respects debouns window
     fn schedule_one(&self, uri: Uri) {
-        if let Some((_, prev)) = self.pending_diags.remove(&uri) {
-            prev.abort();
-        }
-        let workspace = self.workspace.clone();
-        let client = self.client.clone();
-        let pending = self.pending_diags.clone();
-        let key = uri.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(DIAGNOSTICS_DEBOUNCE_MS)).await;
-            let Some(entry) = workspace.docs.get(&uri) else {
-                pending.remove(&uri);
-                return;
-            };
-            let doc = entry.clone();
-            drop(entry);
-            let guard = doc.read().await;
-            let diags = diagnostics::compute(&workspace, &guard).await;
-            let version = guard.version;
-            drop(guard);
-            client
-                .publish_diagnostics(uri.clone(), diags, Some(version))
-                .await;
-            pending.remove(&uri);
-        });
-        self.pending_diags.insert(key, handle);
+        schedule_one(
+            self.workspace.clone(),
+            self.client.clone(),
+            self.pending_diags.clone(),
+            uri,
+        );
     }
 }
 
+/// Cancel any pending diagnostics publish for `uri` and schedule a fresh one.
+fn schedule_one(
+    workspace: Arc<Workspace>,
+    client: Client,
+    pending: Arc<DashMap<Uri, JoinHandle<()>>>,
+    uri: Uri,
+) {
+    if let Some((_, prev)) = pending.remove(&uri) {
+        prev.abort();
+    }
+    let key = uri.clone();
+    let workspace_for_task = workspace.clone();
+    let pending_for_task = pending.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(DIAGNOSTICS_DEBOUNCE_MS)).await;
+        let Some(entry) = workspace_for_task.docs.get(&uri) else {
+            pending_for_task.remove(&uri);
+            return;
+        };
+        let doc = entry.clone();
+        drop(entry);
+        let guard = doc.read().await;
+        let diags = diagnostics::compute(&workspace_for_task, &guard).await;
+        let version = guard.version;
+        drop(guard);
+        client
+            .publish_diagnostics(uri.clone(), diags, Some(version))
+            .await;
+        pending_for_task.remove(&uri);
+    });
+    pending.insert(key, handle);
+}
+
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> RpcResult<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
+        self.workspace.set_roots(collect_roots(&params));
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -111,6 +126,20 @@ impl LanguageServer for Backend {
             env!("CARGO_PKG_VERSION"),
         );
         self.client.log_message(MessageType::INFO, &banner).await;
+        let ws = self.workspace.clone();
+        let client = self.client.clone();
+        let pending = self.pending_diags.clone();
+        tokio::spawn(async move {
+            let ws_blk = ws.clone();
+            let _ = tokio::task::spawn_blocking(move || ws_blk.scan_workspace()).await;
+            client
+                .log_message(MessageType::INFO, "workspace scan complete")
+                .await;
+            let open_uris: Vec<Uri> = ws.docs.iter().map(|e| e.key().clone()).collect();
+            for uri in open_uris {
+                schedule_one(ws.clone(), client.clone(), pending.clone(), uri);
+            }
+        });
     }
 
     async fn shutdown(&self) -> RpcResult<()> {
@@ -185,4 +214,37 @@ impl LanguageServer for Backend {
         let guard = doc.read().await;
         Ok(hover::hover(&self.workspace, &guard, &params).await)
     }
+}
+
+/// Extract workspace roots from `InitializeParams`.
+///
+/// Prefers `workspace_folders`, falls back to deprecated `root_uri`, then `root_path`.
+fn collect_roots(params: &InitializeParams) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let push = |path: PathBuf, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>| {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if seen.insert(canon) {
+            out.push(path);
+        }
+    };
+
+    if let Some(folders) = &params.workspace_folders {
+        for folder in folders {
+            if let Some(p) = uri_to_path(&folder.uri) {
+                push(p, &mut out, &mut seen);
+            }
+        }
+    }
+    #[allow(deprecated)]
+    if let Some(uri) = &params.root_uri {
+        if let Some(p) = uri_to_path(uri) {
+            push(p, &mut out, &mut seen);
+        }
+    }
+    #[allow(deprecated)]
+    if let Some(s) = &params.root_path {
+        push(PathBuf::from(s), &mut out, &mut seen);
+    }
+    out
 }

@@ -5,9 +5,10 @@
 //! Handles transitive symbol lookup with cycle detection.
 
 use std::collections::{HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use dashmap::DashMap;
@@ -63,6 +64,8 @@ pub struct Workspace {
     pub disk: DashMap<PathBuf, Arc<DiskFile>>,
     /// Remebers dependent paths.
     pub dependents: DashMap<PathBuf, HashSet<Uri>>,
+    /// Workspace root directories captured at LSP `initialize`.
+    pub roots: OnceLock<Vec<PathBuf>>,
 }
 
 impl Workspace {
@@ -71,6 +74,35 @@ impl Workspace {
             docs: DashMap::new(),
             disk: DashMap::new(),
             dependents: DashMap::new(),
+            roots: OnceLock::new(),
+        }
+    }
+
+    pub fn set_roots(&self, roots: Vec<PathBuf>) {
+        let _ = self.roots.set(roots);
+    }
+
+    /// Recursively walk every stored root, parsing each `*.foobar` file into `self.disk`.
+    pub fn scan_workspace(&self) {
+        let Some(roots) = self.roots.get() else {
+            return;
+        };
+        for path in walk_foobar_files(roots) {
+            if self.find_open_doc(&path).is_some() {
+                continue;
+            }
+            let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let cached_is_fresh = self
+                .disk
+                .get(&path)
+                .map(|e| e.mtime == mtime)
+                .unwrap_or(false);
+            if cached_is_fresh {
+                continue;
+            }
+            if let Some(loaded) = self.load_disk_file(&path) {
+                self.disk.insert(path, Arc::new(loaded));
+            }
         }
     }
 
@@ -309,7 +341,53 @@ impl Workspace {
             }
         }
 
+        // Workspace-wide pool fallback.
+        let doc_arcs: Vec<Arc<RwLock<Document>>> =
+            self.docs.iter().map(|e| e.value().clone()).collect();
+        for doc_arc in doc_arcs {
+            if doc_arc.read().await.symbols.defines.contains_key(name) {
+                return true;
+            }
+        }
+        for entry in self.disk.iter() {
+            if entry.value().symbols.defines.contains_key(name) {
+                return true;
+            }
+        }
         false
+    }
+
+    /// Workspace-wide count of `%(name)` references.
+    pub async fn count_refs(&self, name: &str) -> usize {
+        let mut n = 0usize;
+        let mut doc_paths: HashSet<PathBuf> = HashSet::new();
+        let doc_arcs: Vec<Arc<RwLock<Document>>> =
+            self.docs.iter().map(|e| e.value().clone()).collect();
+        for doc_arc in doc_arcs {
+            let guard = doc_arc.read().await;
+            n += guard
+                .symbols
+                .var_refs
+                .iter()
+                .filter(|(k, _)| k == name)
+                .count();
+            if let Some(p) = uri_to_path(&guard.uri).and_then(|p| p.canonicalize().ok()) {
+                doc_paths.insert(p);
+            }
+        }
+        for entry in self.disk.iter() {
+            if doc_paths.contains(entry.key()) {
+                continue;
+            }
+            n += entry
+                .value()
+                .symbols
+                .var_refs
+                .iter()
+                .filter(|(k, _)| k == name)
+                .count();
+        }
+        n
     }
 
     /// Count defines in a resolved include target (looking at open doc first, then disk).
@@ -331,10 +409,57 @@ impl Default for Workspace {
     }
 }
 
+/// Iterative DFS over `roots`, returning every `*.foobar` file found.
+fn walk_foobar_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+    const SKIP_DIRS: &[&str] = &["node_modules", "target"];
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut stack: Vec<PathBuf> = Vec::new();
+
+    for root in roots {
+        let canon = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if visited.insert(canon.clone()) {
+            stack.push(canon);
+        }
+    }
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(ty) = entry.file_type() else {
+                continue;
+            };
+            if ty.is_dir() {
+                if SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if visited.insert(canon.clone()) {
+                    stack.push(canon);
+                }
+            } else if ty.is_file() && path.extension() == Some(OsStr::new("foobar")) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::document::Document;
+    use std::str::FromStr;
     use tempfile::TempDir;
     use tower_lsp_server::ls_types::{DidOpenTextDocumentParams, TextDocumentItem};
 
@@ -512,5 +637,149 @@ mod tests {
 
         ws.forget_doc(&main_uri);
         assert!(ws.dependents_of(&inc_canon).is_empty());
+    }
+
+    #[test]
+    fn scan_workspace_loads_files() {
+        let ws = Workspace::new();
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.foobar");
+        let b = dir.path().join("nested").join("b.foobar");
+        fs::create_dir_all(b.parent().unwrap()).unwrap();
+        fs::write(&a, "defines\nx: \"1\"\n").unwrap();
+        fs::write(&b, "defines\ny: \"2\"\n").unwrap();
+
+        ws.set_roots(vec![dir.path().to_path_buf()]);
+        ws.scan_workspace();
+
+        let a_canon = a.canonicalize().unwrap();
+        let b_canon = b.canonicalize().unwrap();
+        assert!(ws.disk.get(&a_canon).is_some(), "missing a");
+        assert!(ws.disk.get(&b_canon).is_some(), "missing b");
+    }
+
+    #[test]
+    fn scan_workspace_skips_hidden_and_blacklisted_dirs() {
+        let ws = Workspace::new();
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        fs::create_dir_all(dir.path().join("target")).unwrap();
+        fs::write(dir.path().join(".git/x.foobar"), "").unwrap();
+        fs::write(dir.path().join("node_modules/y.foobar"), "").unwrap();
+        fs::write(dir.path().join("target/z.foobar"), "").unwrap();
+        let c = dir.path().join("c.foobar");
+        fs::write(&c, "").unwrap();
+
+        ws.set_roots(vec![dir.path().to_path_buf()]);
+        ws.scan_workspace();
+
+        let c_canon = c.canonicalize().unwrap();
+        assert!(ws.disk.get(&c_canon).is_some());
+        assert_eq!(ws.disk.len(), 1, "skipped dirs leaked in");
+    }
+
+    #[test]
+    fn scan_workspace_respects_mtime_cache() {
+        let ws = Workspace::new();
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.foobar");
+        fs::write(&a, "defines\nx: \"1\"\n").unwrap();
+        ws.set_roots(vec![dir.path().to_path_buf()]);
+        ws.scan_workspace();
+        let canon = a.canonicalize().unwrap();
+        let first = Arc::clone(&ws.disk.get(&canon).unwrap());
+        // Second scan with no file change: should not reload (same Arc).
+        ws.scan_workspace();
+        let second = Arc::clone(&ws.disk.get(&canon).unwrap());
+        assert!(Arc::ptr_eq(&first, &second), "reloaded despite same mtime");
+    }
+
+    #[tokio::test]
+    async fn scan_workspace_skips_open_docs() {
+        let ws = Workspace::new();
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.foobar");
+        fs::write(&a, "defines\nx: \"1\"\n").unwrap();
+        let a_uri = path_to_uri(&a).unwrap();
+        ws.docs.insert(
+            a_uri.clone(),
+            Arc::new(RwLock::new(open_doc(a_uri, "defines\nx: \"1\"\n"))),
+        );
+
+        ws.set_roots(vec![dir.path().to_path_buf()]);
+        ws.scan_workspace();
+
+        let canon = a.canonicalize().unwrap();
+        assert!(
+            ws.disk.get(&canon).is_none(),
+            "open-doc file leaked into disk cache"
+        );
+    }
+
+    #[test]
+    fn scan_workspace_handles_missing_root() {
+        let ws = Workspace::new();
+        ws.set_roots(vec![PathBuf::from("/this/path/does/not/exist")]);
+        ws.scan_workspace(); // must not panic
+        assert_eq!(ws.disk.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_workspace_symlink_loop_terminates() {
+        let ws = Workspace::new();
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.foobar");
+        fs::write(&a, "").unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("self_loop")).unwrap();
+
+        ws.set_roots(vec![dir.path().to_path_buf()]);
+        ws.scan_workspace(); // must terminate
+        let canon = a.canonicalize().unwrap();
+        assert!(ws.disk.get(&canon).is_some());
+    }
+
+    #[tokio::test]
+    async fn has_define_pool_fallback_finds_unrelated_file() {
+        let ws = Workspace::new();
+        let dir = TempDir::new().unwrap();
+        // A defines foo. B does NOT include A and uses %(foo).
+        let a = dir.path().join("a.foobar");
+        let b = dir.path().join("b.foobar");
+        fs::write(&a, "defines\nfoo: \"hello\"\n").unwrap();
+        fs::write(&b, "defines\nbar: \"%(foo)\"\n").unwrap();
+
+        ws.set_roots(vec![dir.path().to_path_buf()]);
+        ws.scan_workspace();
+
+        let b_uri = path_to_uri(&b).unwrap();
+        let b_doc = open_doc(b_uri.clone(), &fs::read_to_string(&b).unwrap());
+        // Pool fallback must see foo from a.foobar even though b doesn't include a.
+        assert!(ws.has_define(&b_uri, &b_doc.symbols, "foo").await);
+    }
+
+    #[tokio::test]
+    async fn has_define_pool_fallback_false_when_nowhere() {
+        let ws = Workspace::new();
+        let dir = TempDir::new().unwrap();
+        let b = dir.path().join("b.foobar");
+        fs::write(&b, "defines\nbar: \"%(ghost)\"\n").unwrap();
+
+        ws.set_roots(vec![dir.path().to_path_buf()]);
+        ws.scan_workspace();
+
+        let b_uri = path_to_uri(&b).unwrap();
+        let b_doc = open_doc(b_uri.clone(), &fs::read_to_string(&b).unwrap());
+        assert!(!ws.has_define(&b_uri, &b_doc.symbols, "ghost").await);
+    }
+
+    #[tokio::test]
+    async fn has_define_local_still_wins() {
+        // Regression: pool fallback must not change the local-hit path.
+        let ws = Workspace::new();
+        let uri = Uri::from_str("file:///x.foobar").unwrap();
+        let doc = open_doc(uri.clone(), "defines\nfoo: \"1\"\n");
+        assert!(ws.has_define(&uri, &doc.symbols, "foo").await);
     }
 }

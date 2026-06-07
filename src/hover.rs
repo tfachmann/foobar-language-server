@@ -69,7 +69,7 @@ async fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option
                 .map(|s| s.kind() == "section_defines")
                 .unwrap_or(false);
             if in_defines {
-                hover_defines_key(doc, &name)
+                hover_defines_key(workspace, doc, &name).await
             } else {
                 hover_process_entry_key(&name)
             }
@@ -106,9 +106,9 @@ async fn hover_variable_use(workspace: &Workspace, doc: &Document, name: &str) -
     ))
 }
 
-fn hover_defines_key(doc: &Document, name: &str) -> Option<String> {
+async fn hover_defines_key(workspace: &Workspace, doc: &Document, name: &str) -> Option<String> {
     let entry = doc.symbols.defines.get(name)?;
-    let n = entry.refs.len();
+    let n = workspace.count_refs(name).await;
     let usage = match n {
         0 => "_unused_".to_string(),
         1 => "_used 1 time_".to_string(),
@@ -299,6 +299,41 @@ mod tests {
         assert!(s.contains("**name**"), "got: {s}");
         assert!(s.contains("timo"), "got: {s}");
         assert!(s.contains("inc.foobar"), "got: {s}");
+    }
+
+    #[tokio::test]
+    async fn hover_defines_key_counts_cross_file_refs() {
+        let dir = TempDir::new().unwrap();
+        let inc_path = dir.path().join("inc.foobar");
+        let main_path = dir.path().join("main.foobar");
+        fs::write(&inc_path, "defines\nfile_name: \"slides\"\n").unwrap();
+        let main_text = "include inc.foobar\n\ndefines\nout: \"%(file_name).pdf\"\nsrc: \"%(file_name).typst\"\n";
+        fs::write(&main_path, main_text).unwrap();
+        let inc_uri = path_to_uri(&inc_path).unwrap();
+
+        let ws = Workspace::new();
+        // Only inc is open; main lives on disk (mirrors the user's scenario
+        // of opening some_other.foobar without opening example.foobar).
+        let inc_doc = open_doc(inc_uri.clone(), &fs::read_to_string(&inc_path).unwrap());
+        ws.docs.insert(
+            inc_uri.clone(),
+            Arc::new(RwLock::new(open_doc(
+                inc_uri.clone(),
+                &fs::read_to_string(&inc_path).unwrap(),
+            ))),
+        );
+        // Make main discoverable via workspace scan.
+        ws.set_roots(vec![dir.path().to_path_buf()]);
+        ws.scan_workspace();
+
+        // Line 1, col 0 = `f` of `file_name:` in inc.foobar.
+        let s = hover_at(&ws, &inc_doc, &inc_uri, 1, 0).await.unwrap();
+        assert!(s.contains("file_name"), "got: {s}");
+        assert!(
+            s.contains("used 2 times"),
+            "expected 2 cross-file refs, got: {s}"
+        );
+        assert!(!s.contains("unused"), "got: {s}");
     }
 
     #[tokio::test]

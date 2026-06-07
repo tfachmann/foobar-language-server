@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use ropey::Rope;
 use tower_lsp_server::ls_types::{
-    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, NumberOrString, Range,
-    Uri,
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
+    NumberOrString, Range, Uri,
 };
 use tree_sitter::Tree;
 
@@ -24,6 +24,7 @@ pub async fn compute(workspace: &Workspace, doc: &Document) -> Vec<Diagnostic> {
     collect_missing_includes(workspace, &doc.uri, &doc.symbols, &mut out);
     collect_cycles(workspace, doc, &mut out).await;
     collect_includes_diags(workspace, doc, &mut out).await;
+    collect_unused_defines(workspace, doc, &mut out).await;
     out
 }
 
@@ -218,6 +219,25 @@ async fn collect_includes_diags(workspace: &Workspace, doc: &Document, out: &mut
                 inc.path_range,
                 &d,
             ));
+        }
+    }
+}
+
+/// Warning for unused defines (over workspace).
+async fn collect_unused_defines(workspace: &Workspace, doc: &Document, out: &mut Vec<Diagnostic>) {
+    for (name, entry) in &doc.symbols.defines {
+        if workspace.count_refs(name).await == 0 {
+            out.push(Diagnostic {
+                range: entry.key_range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                code: Some(NumberOrString::String("unused-define".to_string())),
+                code_description: None,
+                source: Some("foobar".to_string()),
+                message: format!("`{name}` is defined but never referenced"),
+                related_information: None,
+                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                data: None,
+            });
         }
     }
 }
@@ -533,6 +553,68 @@ mod tests {
         assert!(
             diags.iter().any(|d| code_of(d) == "included-error"),
             "got: {diags:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unused_define_emits_warning_with_unnecessary_tag() {
+        use tower_lsp_server::ls_types::DiagnosticTag;
+        let uri = Uri::from_str("file:///x.foobar").unwrap();
+        let text = "defines\nfoo: \"1\"\nbar: \"%(foo)\"\n";
+        let doc = open_doc(uri.clone(), text);
+        let ws = Workspace::new();
+        // Insert into workspace.docs so count_refs sees the local refs.
+        ws.docs
+            .insert(uri.clone(), Arc::new(RwLock::new(open_doc(uri, text))));
+        let diags = compute(&ws, &doc).await;
+        let unused: Vec<_> = diags
+            .iter()
+            .filter(|d| code_of(d) == "unused-define")
+            .collect();
+        // `foo` is used once (in bar); `bar` is unused.
+        assert_eq!(unused.len(), 1, "got: {diags:?}");
+        assert_eq!(unused[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            unused[0].tags.as_deref(),
+            Some(&[DiagnosticTag::UNNECESSARY][..]),
+        );
+        assert!(
+            unused[0].message.contains("bar"),
+            "got: {}",
+            unused[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn unused_define_silenced_by_cross_file_ref() {
+        let dir = TempDir::new().unwrap();
+        let inc_path = dir.path().join("inc.foobar");
+        let main_path = dir.path().join("main.foobar");
+        fs::write(&inc_path, "defines\nfile_name: \"slides\"\n").unwrap();
+        let main_text = "include inc.foobar\n\ndefines\nout: \"%(file_name).pdf\"\n";
+        fs::write(&main_path, main_text).unwrap();
+        let inc_uri = path_to_uri(&inc_path).unwrap();
+
+        let ws = Workspace::new();
+        let inc_doc = open_doc(inc_uri.clone(), &fs::read_to_string(&inc_path).unwrap());
+        ws.docs.insert(
+            inc_uri.clone(),
+            Arc::new(RwLock::new(open_doc(
+                inc_uri,
+                &fs::read_to_string(&inc_path).unwrap(),
+            ))),
+        );
+        ws.set_roots(vec![dir.path().to_path_buf()]);
+        ws.scan_workspace();
+
+        let diags = compute(&ws, &inc_doc).await;
+        let unused: Vec<_> = diags
+            .iter()
+            .filter(|d| code_of(d) == "unused-define")
+            .collect();
+        assert!(
+            unused.iter().all(|d| !d.message.contains("file_name")),
+            "file_name flagged as unused despite cross-file ref: {unused:?}"
         );
     }
 }
