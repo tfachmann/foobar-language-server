@@ -2,8 +2,10 @@
 
 use anyhow::{Context, Result};
 use ropey::Rope;
-use tower_lsp_server::ls_types::{DidChangeTextDocumentParams, DidOpenTextDocumentParams, Uri};
-use tree_sitter::{Parser, Tree};
+use tower_lsp_server::ls_types::{
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, Position, Uri,
+};
+use tree_sitter::{Node, Parser, Tree};
 
 use crate::symbol::SymbolIndex;
 use crate::text::RopeExt;
@@ -78,25 +80,21 @@ impl Document {
         self.symbols = SymbolIndex::from_tree(&self.tree, &self.rope);
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::str::FromStr;
-    use tower_lsp_server::ls_types::{
-        Position, Range, TextDocumentContentChangeEvent, TextDocumentItem,
-        VersionedTextDocumentIdentifier,
-    };
-
-    fn uri() -> Uri {
-        Uri::from_str("file:///test.foobar").unwrap()
+    /// Smallest tree-sitter node at the LSP cursor position.
+    pub fn node_at(&self, pos: Position) -> Option<Node<'_>> {
+        let point = self.rope.lsp_position_to_text_pos(pos).point;
+        self.tree
+            .root_node()
+            .descendant_for_point_range(point, point)
     }
 
-    fn open(text: &str) -> Document {
-        Document::open(DidOpenTextDocumentParams {
+    #[cfg(test)]
+    pub fn from_text(uri: Uri, text: &str) -> Self {
+        use tower_lsp_server::ls_types::TextDocumentItem;
+        Self::open(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
-                uri: uri(),
+                uri,
                 language_id: "foobar".to_string(),
                 version: 1,
                 text: text.to_string(),
@@ -104,12 +102,25 @@ mod tests {
         })
         .unwrap()
     }
+}
 
-    fn change(doc: &mut Document, version: i32, range: Option<Range>, text: &str) {
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+    use tower_lsp_server::ls_types::{
+        Range, TextDocumentContentChangeEvent, VersionedTextDocumentIdentifier,
+    };
+
+    fn uri() -> Uri {
+        Uri::from_str("file:///test.foobar").unwrap()
+    }
+
+    fn change(doc: &mut Document, range: Option<Range>, text: &str) {
         doc.apply_change(DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
                 uri: uri(),
-                version,
+                version: doc.version + 1,
             },
             content_changes: vec![TextDocumentContentChangeEvent {
                 range,
@@ -120,74 +131,35 @@ mod tests {
         .unwrap();
     }
 
-    fn assert_consistent(doc: &Document) {
-        // Tree byte range must equal rope byte length.
-        let tree_end = doc.tree.root_node().end_byte();
-        assert_eq!(tree_end, doc.rope.len_bytes(), "tree end vs rope bytes");
+    fn range(l0: u32, c0: u32, l1: u32, c1: u32) -> Range {
+        Range::new(Position::new(l0, c0), Position::new(l1, c1))
     }
 
+    /// Incremental edits must leave rope and tree exactly as a fresh parse of the same text would.
     #[test]
-    fn open_then_no_changes() {
-        let doc = open("defines\nname: \"x\"\n");
-        assert_consistent(&doc);
-        assert!(doc.symbols.defines.contains_key("name"));
-    }
+    fn incremental_edits_match_fresh_parse() {
+        let mut doc = Document::from_text(uri(), "defines\ngreet: \"héllo\"\n");
 
-    #[test]
-    fn insert_at_end() {
-        let mut doc = open("defines\nname: \"x\"\n");
-        let end_pos = doc.rope.byte_to_lsp_position(doc.rope.len_bytes());
-        change(
-            &mut doc,
-            2,
-            Some(Range::new(end_pos, end_pos)),
-            "other: \"y\"\n",
-        );
-        assert_consistent(&doc);
-        assert!(doc.symbols.defines.contains_key("other"));
-    }
+        change(&mut doc, Some(range(1, 8, 1, 13)), "wörld"); // replace inside a multibyte value
+        change(&mut doc, Some(range(2, 0, 2, 0)), "name: \"%(greet)\"\n"); // append a line
+        change(&mut doc, Some(range(0, 0, 0, 0)), "# 😀\n"); // multibyte on an earlier line
+        change(&mut doc, Some(range(3, 0, 3, 4)), "user"); // rename key below it
 
-    #[test]
-    fn replace_value() {
-        let mut doc = open("defines\nname: \"old\"\n");
-        // Replace the value "old" with "new".
-        let start = Position::new(1, 7);
-        let end = Position::new(1, 10);
-        change(&mut doc, 2, Some(Range::new(start, end)), "new");
-        assert_consistent(&doc);
-        assert_eq!(doc.symbols.defines.get("name").unwrap().value_text, "new");
-    }
-
-    #[test]
-    fn insert_at_start() {
-        let mut doc = open("name: \"x\"\n");
-        let zero = Position::new(0, 0);
-        change(&mut doc, 2, Some(Range::new(zero, zero)), "defines\n");
-        assert_consistent(&doc);
-        assert!(doc.symbols.defines.contains_key("name"));
-    }
-
-    #[test]
-    fn multibyte_edit() {
-        // "héllo" has é (2 bytes UTF-8, 1 UTF-16 cu)
-        let mut doc = open("defines\ngreet: \"héllo\"\n");
-        assert_consistent(&doc);
-        // Replace entire value "héllo" with "world"
-        let start = Position::new(1, 8);
-        let end = Position::new(1, 13);
-        change(&mut doc, 2, Some(Range::new(start, end)), "world");
-        assert_consistent(&doc);
+        let text = "# 😀\ndefines\ngreet: \"wörld\"\nuser: \"%(greet)\"\n";
+        assert_eq!(doc.rope.to_string(), text);
+        let fresh = Document::from_text(uri(), text);
         assert_eq!(
-            doc.symbols.defines.get("greet").unwrap().value_text,
-            "world"
+            doc.tree.root_node().to_sexp(),
+            fresh.tree.root_node().to_sexp()
         );
+        assert_eq!(doc.symbols.defines["greet"].value_text, "wörld");
+        assert!(doc.symbols.defines.contains_key("user"));
     }
 
     #[test]
-    fn full_replace_no_range() {
-        let mut doc = open("defines\na: \"1\"\n");
-        change(&mut doc, 2, None, "defines\nb: \"2\"\n");
-        assert_consistent(&doc);
+    fn full_replace_without_range() {
+        let mut doc = Document::from_text(uri(), "defines\na: \"1\"\n");
+        change(&mut doc, None, "defines\nb: \"2\"\n");
         assert!(doc.symbols.defines.contains_key("b"));
         assert!(!doc.symbols.defines.contains_key("a"));
     }

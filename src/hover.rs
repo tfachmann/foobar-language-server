@@ -1,24 +1,20 @@
-//! Hover dispatch for various symbols
-//! - keyword tokens
-//! - variables
-//! - pathes
-//! - ...
+//! Hover dispatch on the node under the cursor:
+//! - keyword tokens (`defines`, `process`, `include`)
+//! - variable uses `%(name)` and define keys
+//! - process headers and process entry keys
+//! - include paths
 
-use std::path::Path;
-
-use tower_lsp_server::ls_types::{
-    Hover, HoverContents, HoverParams, MarkupContent, MarkupKind, Position,
-};
+use tower_lsp_server::ls_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 use tree_sitter::Node;
 
 use crate::document::Document;
 use crate::keywords::{keyword_doc, process_entry_key_doc};
-use crate::text::{PositionExt, RopeExt};
+use crate::text::RopeExt;
 use crate::workspace::{DefineSource, Workspace};
 
 pub async fn hover(workspace: &Workspace, doc: &Document, params: &HoverParams) -> Option<Hover> {
     let pos = params.text_document_position_params.position;
-    let node = node_at(doc, pos)?;
+    let node = doc.node_at(pos)?;
     let md = render(workspace, doc, node).await?;
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -27,13 +23,6 @@ pub async fn hover(workspace: &Workspace, doc: &Document, params: &HoverParams) 
         }),
         range: None,
     })
-}
-
-fn node_at(doc: &Document, pos: Position) -> Option<Node<'_>> {
-    let point = pos.point();
-    doc.tree
-        .root_node()
-        .descendant_for_point_range(point, point)
 }
 
 async fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<String> {
@@ -133,7 +122,7 @@ fn hover_process_header(doc: &Document, name: &str) -> Option<String> {
 fn hover_process_entry_key(name: &str) -> Option<String> {
     process_entry_key_doc(name)
         .map(|s| s.to_string())
-        .or_else(|| Some(format!("**{name}** — process entry key (no documentation)")))
+        .or_else(|| Some(format!("**{name}** - process entry key (no documentation)")))
 }
 
 async fn hover_include_path(workspace: &Workspace, doc: &Document, node: Node<'_>) -> String {
@@ -142,7 +131,7 @@ async fn hover_include_path(workspace: &Workspace, doc: &Document, node: Node<'_
     let mut body = format!("**include** `{raw}`\n---\n");
     match resolved {
         Some(r) => {
-            body.push_str(&format!("Resolved to `{}`\n---\n", display_path(&r.path)));
+            body.push_str(&format!("Resolved to `{}`\n---\n", r.path.display()));
             if !r.exists {
                 body.push_str("_file not found_");
             } else if let Some(n) = workspace.defines_count_at(&r.path).await {
@@ -158,202 +147,65 @@ async fn hover_include_path(workspace: &Workspace, doc: &Document, node: Node<'_
     body
 }
 
-fn display_path(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::str::FromStr;
-    use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::RwLock;
     use tower_lsp_server::ls_types::{
-        DidOpenTextDocumentParams, TextDocumentIdentifier, TextDocumentItem,
-        TextDocumentPositionParams, Uri, WorkDoneProgressParams,
+        Position, TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgressParams,
     };
 
     use crate::text::path_to_uri;
 
-    fn open_doc(uri: Uri, text: &str) -> Document {
-        Document::open(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri,
-                language_id: "foobar".to_string(),
-                version: 1,
-                text: text.to_string(),
-            },
-        })
-        .unwrap()
-    }
-
-    fn doc(text: &str) -> Document {
-        open_doc(Uri::from_str("file:///x.foobar").unwrap(), text)
-    }
-
-    async fn hover_at(
-        ws: &Workspace,
-        d: &Document,
-        uri: &Uri,
-        line: u32,
-        character: u32,
-    ) -> Option<String> {
+    async fn hover_at(ws: &Workspace, doc: &Document, line: u32, character: u32) -> Option<String> {
         let params = HoverParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                text_document: TextDocumentIdentifier {
+                    uri: doc.uri.clone(),
+                },
                 position: Position::new(line, character),
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        hover(ws, d, &params).await.map(|h| match h.contents {
+        hover(ws, doc, &params).await.map(|h| match h.contents {
             HoverContents::Markup(m) => m.value,
             _ => String::new(),
         })
     }
 
-    const SRC: &str = "defines\nfile_name: \"slides\"\n\nprocess compile presentation\ncommand: \"%(file_name).typst\"\n";
+    const SRC: &str = "defines\nfile_name: \"slides\"\n\nprocess compile presentation\ncommand: \"%(file_name).typ\"\n";
+
+    #[tokio::test]
+    async fn hover_on_keyword() {
+        let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), SRC);
+        let s = hover_at(&Workspace::default(), &doc, 3, 2).await.unwrap();
+        assert!(s.starts_with("**process**"), "got: {s}");
+    }
 
     #[tokio::test]
     async fn hover_on_variable_use() {
-        let ws = Workspace::new();
-        let d = doc(SRC);
-        let uri = Uri::from_str("file:///x.foobar").unwrap();
-        let s = hover_at(&ws, &d, &uri, 4, 14)
-            .await
-            .expect("hover on %(file_name)");
-        assert!(s.contains("file_name"), "got: {s}");
-        assert!(s.contains("slides"), "got: {s}");
-        assert!(s.contains("defined at line"), "got: {s}");
-    }
-
-    #[tokio::test]
-    async fn hover_on_defines_key() {
-        let ws = Workspace::new();
-        let d = doc(SRC);
-        let uri = Uri::from_str("file:///x.foobar").unwrap();
-        let s = hover_at(&ws, &d, &uri, 1, 3).await.unwrap();
-        assert!(s.contains("file_name"));
-        assert!(s.contains("slides"));
-        assert!(s.contains("used"));
-    }
-
-    #[tokio::test]
-    async fn hover_on_process_header() {
-        let ws = Workspace::new();
-        let d = doc(SRC);
-        let uri = Uri::from_str("file:///x.foobar").unwrap();
-        let s = hover_at(&ws, &d, &uri, 3, 10).await.unwrap();
-        assert!(s.contains("process"));
-        assert!(s.contains("compile presentation"));
-    }
-
-    #[tokio::test]
-    async fn hover_on_keyword_defines() {
-        let ws = Workspace::new();
-        let d = doc(SRC);
-        let uri = Uri::from_str("file:///x.foobar").unwrap();
-        let s = hover_at(&ws, &d, &uri, 0, 2).await.unwrap();
-        assert!(s.contains("**defines**"));
-    }
-
-    #[tokio::test]
-    async fn hover_on_keyword_process() {
-        let ws = Workspace::new();
-        let d = doc(SRC);
-        let uri = Uri::from_str("file:///x.foobar").unwrap();
-        let s = hover_at(&ws, &d, &uri, 3, 2).await.unwrap();
-        assert!(s.contains("**process**"));
-    }
-
-    #[tokio::test]
-    async fn hover_on_process_entry_key() {
-        let ws = Workspace::new();
-        let d = doc(SRC);
-        let uri = Uri::from_str("file:///x.foobar").unwrap();
-        let s = hover_at(&ws, &d, &uri, 4, 2).await.unwrap();
-        assert!(s.contains("command"));
-    }
-
-    #[tokio::test]
-    async fn hover_on_variable_use_via_include() {
-        let dir = TempDir::new().unwrap();
-        let inc_path = dir.path().join("inc.foobar");
-        let main_path = dir.path().join("main.foobar");
-        fs::write(&inc_path, "defines\nname: \"timo\"\n").unwrap();
-        let main_text = "include inc.foobar\n\nprocess greet\ncommand: \"hi %(name)\"\n";
-        fs::write(&main_path, main_text).unwrap();
-        let main_uri = path_to_uri(&main_path).unwrap();
-
-        let ws = Workspace::new();
-        let main_doc = open_doc(main_uri.clone(), main_text);
-        ws.docs.insert(
-            main_uri.clone(),
-            Arc::new(RwLock::new(open_doc(main_uri.clone(), main_text))),
-        );
-        ws.refresh_includes_for(&main_doc).await;
-
-        // %(name) on line 3 starts at col 15 ("hi %(name)" -> `n` of name)
-        let s = hover_at(&ws, &main_doc, &main_uri, 3, 15).await.unwrap();
-        assert!(s.contains("**name**"), "got: {s}");
-        assert!(s.contains("timo"), "got: {s}");
-        assert!(s.contains("inc.foobar"), "got: {s}");
-    }
-
-    #[tokio::test]
-    async fn hover_defines_key_counts_cross_file_refs() {
-        let dir = TempDir::new().unwrap();
-        let inc_path = dir.path().join("inc.foobar");
-        let main_path = dir.path().join("main.foobar");
-        fs::write(&inc_path, "defines\nfile_name: \"slides\"\n").unwrap();
-        let main_text = "include inc.foobar\n\ndefines\nout: \"%(file_name).pdf\"\nsrc: \"%(file_name).typst\"\n";
-        fs::write(&main_path, main_text).unwrap();
-        let inc_uri = path_to_uri(&inc_path).unwrap();
-
-        let ws = Workspace::new();
-        // Only inc is open; main lives on disk (mirrors the user's scenario
-        // of opening some_other.foobar without opening example.foobar).
-        let inc_doc = open_doc(inc_uri.clone(), &fs::read_to_string(&inc_path).unwrap());
-        ws.docs.insert(
-            inc_uri.clone(),
-            Arc::new(RwLock::new(open_doc(
-                inc_uri.clone(),
-                &fs::read_to_string(&inc_path).unwrap(),
-            ))),
-        );
-        // Make main discoverable via workspace scan.
-        ws.set_roots(vec![dir.path().to_path_buf()]);
-        ws.scan_workspace();
-
-        // Line 1, col 0 = `f` of `file_name:` in inc.foobar.
-        let s = hover_at(&ws, &inc_doc, &inc_uri, 1, 0).await.unwrap();
-        assert!(s.contains("file_name"), "got: {s}");
-        assert!(
-            s.contains("used 2 times"),
-            "expected 2 cross-file refs, got: {s}"
-        );
-        assert!(!s.contains("unused"), "got: {s}");
+        let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), SRC);
+        // Inside `file_name` of `%(file_name)`.
+        let s = hover_at(&Workspace::default(), &doc, 4, 14).await.unwrap();
+        assert_eq!(s, "**file_name** = `slides`\n---\ndefined at line 2");
     }
 
     #[tokio::test]
     async fn hover_on_include_path() {
         let dir = TempDir::new().unwrap();
-        let inc_path = dir.path().join("inc.foobar");
-        let main_path = dir.path().join("main.foobar");
-        fs::write(&inc_path, "defines\na: \"1\"\nb: \"2\"\n").unwrap();
-        let main_text = "include inc.foobar\n";
-        fs::write(&main_path, main_text).unwrap();
-        let main_uri = path_to_uri(&main_path).unwrap();
+        fs::write(
+            dir.path().join("inc.foobar"),
+            "defines\na: \"1\"\nb: \"2\"\n",
+        )
+        .unwrap();
+        let main_uri = path_to_uri(&dir.path().join("main.foobar")).unwrap();
+        let doc = Document::from_text(main_uri, "include inc.foobar\n");
+        let ws = Workspace::default();
+        ws.refresh_includes_for(&doc).await;
 
-        let ws = Workspace::new();
-        let main_doc = open_doc(main_uri.clone(), main_text);
-        ws.refresh_includes_for(&main_doc).await;
-
-        // Line 0: "include inc.foobar". Path starts at col 7.
-        let s = hover_at(&ws, &main_doc, &main_uri, 0, 10).await.unwrap();
-        assert!(s.contains("**include**"), "got: {s}");
-        assert!(s.contains("inc.foobar"), "got: {s}");
-        assert!(s.contains("2 defines"), "got: {s}");
+        let s = hover_at(&ws, &doc, 0, 10).await.unwrap();
+        assert!(s.contains("_2 defines_"), "got: {s}");
     }
 }

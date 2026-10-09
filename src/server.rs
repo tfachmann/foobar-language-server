@@ -27,23 +27,22 @@ use crate::workspace::Workspace;
 const DIAGNOSTICS_DEBOUNCE_MS: u64 = 250;
 
 pub struct Backend {
-    pub client: Client,
-    /// Shared Workspace information.
-    pub workspace: Arc<Workspace>,
+    client: Client,
+    workspace: Arc<Workspace>,
     /// Pending diagnostics-publish tasks per URI. Aborted on subsequent edits.
-    pub pending_diags: Arc<DashMap<Uri, JoinHandle<()>>>,
+    pending_diags: Arc<DashMap<Uri, JoinHandle<()>>>,
 }
 
 impl Backend {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            workspace: Arc::new(Workspace::new()),
+            workspace: Arc::new(Workspace::default()),
             pending_diags: Arc::new(DashMap::new()),
         }
     }
 
-    /// Schedule diagnostics for `uri` and all of its dependenants.
+    /// Schedule diagnostics for `uri` and all open docs that include it.
     fn schedule_diagnostics(&self, uri: Uri) {
         self.schedule_one(uri.clone());
 
@@ -57,7 +56,6 @@ impl Backend {
         }
     }
 
-    /// Cancel any pending diagnostics publish for `uri` and schedule a fresh one.
     fn schedule_one(&self, uri: Uri) {
         schedule_one(
             self.workspace.clone(),
@@ -79,23 +77,16 @@ fn schedule_one(
         prev.abort();
     }
     let key = uri.clone();
-    let workspace_for_task = workspace.clone();
     let pending_for_task = pending.clone();
     let handle = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(DIAGNOSTICS_DEBOUNCE_MS)).await;
-        let Some(entry) = workspace_for_task.docs.get(&uri) else {
-            pending_for_task.remove(&uri);
-            return;
-        };
-        let doc = entry.clone();
-        drop(entry);
-        let guard = doc.read().await;
-        let diags = diagnostics::compute(&workspace_for_task, &guard).await;
-        let version = guard.version;
-        drop(guard);
-        client
-            .publish_diagnostics(uri.clone(), diags, Some(version))
-            .await;
+        if let Some(doc) = workspace.doc(&uri) {
+            let doc = doc.read().await;
+            let diags = diagnostics::compute(&workspace, &doc).await;
+            client
+                .publish_diagnostics(uri.clone(), diags, Some(doc.version))
+                .await;
+        }
         pending_for_task.remove(&uri);
     });
     pending.insert(key, handle);
@@ -131,11 +122,12 @@ impl LanguageServer for Backend {
         let client = self.client.clone();
         let pending = self.pending_diags.clone();
         tokio::spawn(async move {
-            let ws_blk = ws.clone();
-            let _ = tokio::task::spawn_blocking(move || ws_blk.scan_workspace()).await;
+            let scan_ws = ws.clone();
+            let _ = tokio::task::spawn_blocking(move || scan_ws.scan_workspace()).await;
             client
                 .log_message(MessageType::INFO, "workspace scan complete")
                 .await;
+            // Re-check open docs: the scan may resolve previously undefined variables.
             let open_uris: Vec<Uri> = ws.docs.iter().map(|e| e.key().clone()).collect();
             for uri in open_uris {
                 schedule_one(ws.clone(), client.clone(), pending.clone(), uri);
@@ -151,11 +143,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.clone();
         match Document::open(params) {
             Ok(doc) => {
-                let doc_arc = Arc::new(RwLock::new(doc));
-                self.workspace.docs.insert(uri.clone(), doc_arc.clone());
-                let guard = doc_arc.read().await;
-                self.workspace.refresh_includes_for(&guard).await;
-                drop(guard);
+                let doc = Arc::new(RwLock::new(doc));
+                self.workspace.docs.insert(uri.clone(), doc.clone());
+                self.workspace
+                    .refresh_includes_for(&*doc.read().await)
+                    .await;
                 self.schedule_diagnostics(uri);
             }
             Err(e) => {
@@ -168,7 +160,7 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        let Some(entry) = self.workspace.docs.get(&uri) else {
+        let Some(doc) = self.workspace.doc(&uri) else {
             self.client
                 .log_message(
                     MessageType::WARNING,
@@ -177,20 +169,15 @@ impl LanguageServer for Backend {
                 .await;
             return;
         };
-        let doc = entry.clone();
-        drop(entry);
-        {
-            let mut guard = doc.write().await;
-            if let Err(e) = guard.apply_change(params) {
-                self.client
-                    .log_message(MessageType::ERROR, format!("did_change failed: {e:#}"))
-                    .await;
-                return;
-            }
+        if let Err(e) = doc.write().await.apply_change(params) {
+            self.client
+                .log_message(MessageType::ERROR, format!("did_change failed: {e:#}"))
+                .await;
+            return;
         }
-        let guard = doc.read().await;
-        self.workspace.refresh_includes_for(&guard).await;
-        drop(guard);
+        self.workspace
+            .refresh_includes_for(&*doc.read().await)
+            .await;
         self.schedule_diagnostics(uri);
     }
 
@@ -207,13 +194,10 @@ impl LanguageServer for Backend {
 
     async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
-        let Some(entry) = self.workspace.docs.get(uri) else {
+        let Some(doc) = self.workspace.doc(uri) else {
             return Ok(None);
         };
-        let doc = entry.clone();
-        drop(entry);
-        let guard = doc.read().await;
-        Ok(hover::hover(&self.workspace, &guard, &params).await)
+        Ok(hover::hover(&self.workspace, &*doc.read().await, &params).await)
     }
 
     async fn goto_definition(
@@ -221,45 +205,26 @@ impl LanguageServer for Backend {
         params: GotoDefinitionParams,
     ) -> RpcResult<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
-        let Some(entry) = self.workspace.docs.get(uri) else {
+        let Some(doc) = self.workspace.doc(uri) else {
             return Ok(None);
         };
-        let doc = entry.clone();
-        drop(entry);
-        let guard = doc.read().await;
-        Ok(definition::goto(&self.workspace, &guard, &params).await)
+        Ok(definition::goto(&self.workspace, &*doc.read().await, &params).await)
     }
 }
 
 /// Extract workspace roots from `InitializeParams`.
 ///
 /// Prefers `workspace_folders`, falls back to deprecated `root_uri`, then `root_path`.
+#[allow(deprecated)]
 fn collect_roots(params: &InitializeParams) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let push = |path: PathBuf, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>| {
-        let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-        if seen.insert(canon) {
-            out.push(path);
-        }
-    };
+    let folders = params.workspace_folders.iter().flatten().map(|f| &f.uri);
+    let candidates = folders
+        .chain(&params.root_uri)
+        .filter_map(uri_to_path)
+        .chain(params.root_path.iter().map(PathBuf::from));
 
-    if let Some(folders) = &params.workspace_folders {
-        for folder in folders {
-            if let Some(p) = uri_to_path(&folder.uri) {
-                push(p, &mut out, &mut seen);
-            }
-        }
-    }
-    #[allow(deprecated)]
-    if let Some(uri) = &params.root_uri {
-        if let Some(p) = uri_to_path(uri) {
-            push(p, &mut out, &mut seen);
-        }
-    }
-    #[allow(deprecated)]
-    if let Some(s) = &params.root_path {
-        push(PathBuf::from(s), &mut out, &mut seen);
-    }
-    out
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    candidates
+        .filter(|p| seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())))
+        .collect()
 }

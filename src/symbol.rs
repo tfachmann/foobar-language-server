@@ -12,14 +12,11 @@ use crate::text::RopeExt;
 pub struct DefineEntry {
     pub value_text: String,
     pub key_range: Range,
-    pub value_range: Range,
-    pub refs: Vec<Range>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ProcessHeader {
     pub name: String,
-    pub header_range: Range,
     pub entry_count: usize,
 }
 
@@ -63,23 +60,16 @@ impl SymbolIndex {
             }
         }
 
-        let var_refs = collect_refs(root, rope);
-        for (name, range) in &var_refs {
-            if let Some(entry) = defines.get_mut(name) {
-                entry.refs.push(*range);
-            }
-        }
-
         Self {
             defines,
             processes,
             includes,
-            var_refs,
+            var_refs: collect_refs(root, rope),
         }
     }
 }
 
-/// Processes a define section and builds a symbolic representation.
+/// Collects the `key: value` entries of a `defines` section.
 fn collect_defines(section: Node, rope: &Rope) -> Vec<(String, DefineEntry)> {
     let mut cursor = section.walk();
     section
@@ -89,48 +79,33 @@ fn collect_defines(section: Node, rope: &Rope) -> Vec<(String, DefineEntry)> {
             let key_node = entry
                 .children(&mut entry.walk())
                 .find(|c| c.kind() == "identifier")?;
-            let value_node = entry
+            let value_text = entry
                 .children(&mut entry.walk())
-                .find(|c| matches!(c.kind(), "string" | "raw_string"));
-            let (value_text, value_range) = match value_node {
-                Some(v) => (strip_quotes(&rope.node_text(v)), rope.node_range(v)),
-                None => (String::new(), rope.node_range(entry)),
-            };
+                .find(|c| matches!(c.kind(), "string" | "raw_string"))
+                .map(|v| strip_quotes(&rope.node_text(v)))
+                .unwrap_or_default();
             Some((
                 rope.node_text(key_node),
                 DefineEntry {
                     value_text,
                     key_range: rope.node_range(key_node),
-                    value_range,
-                    refs: Vec::new(),
                 },
             ))
         })
         .collect()
 }
 
-/// Processes a process section and builds a symbolic representation.
+/// Collects the name and entry count of a `process` section.
 fn collect_process(section: Node, rope: &Rope) -> ProcessHeader {
     let mut cursor = section.walk();
-    let mut name = String::new();
-    let mut header_end = section.start_byte();
-    let mut entry_count = 0usize;
-
-    for child in section.children(&mut cursor) {
-        match child.kind() {
-            "name" => {
-                name = rope.node_text(child).trim().to_string();
-                header_end = child.end_byte();
-            }
-            "entry" => entry_count += 1,
-            _ => {}
-        }
-    }
-
+    let children: Vec<Node> = section.children(&mut cursor).collect();
     ProcessHeader {
-        name,
-        header_range: rope.byte_range_to_lsp_range(section.start_byte(), header_end),
-        entry_count,
+        name: children
+            .iter()
+            .find(|c| c.kind() == "name")
+            .map(|n| rope.node_text(*n).trim().to_string())
+            .unwrap_or_default(),
+        entry_count: children.iter().filter(|c| c.kind() == "entry").count(),
     }
 }
 
@@ -145,7 +120,7 @@ fn collect_include(section: Node, rope: &Rope) -> Option<IncludeRef> {
     })
 }
 
-/// Computes reference (how often a variable is used)
+/// Collects every `%(name)` use anywhere in the tree.
 fn collect_refs(root: Node, rope: &Rope) -> Vec<(String, Range)> {
     let mut out: Vec<(String, Range)> = Vec::new();
     let mut stack = vec![root];

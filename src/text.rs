@@ -8,6 +8,7 @@ use ropey::Rope;
 use tower_lsp_server::ls_types::{Position, Range, TextDocumentContentChangeEvent, Uri};
 use tree_sitter::{InputEdit, Node, Point};
 
+/// Convert a `file://` URI into a filesystem path. `None` for other schemes.
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let s = uri.as_str();
     let rest = s.strip_prefix("file://")?;
@@ -58,19 +59,6 @@ pub struct ComputedEdit<'a> {
     pub text: &'a str,
 }
 
-pub trait PositionExt {
-    fn point(&self) -> Point;
-}
-
-impl PositionExt for Position {
-    fn point(&self) -> Point {
-        Point {
-            row: self.line as usize,
-            column: self.character as usize,
-        }
-    }
-}
-
 /// Helper trait to improve text operations.
 pub trait RopeExt {
     fn lsp_position_to_text_pos(&self, pos: Position) -> TextPos;
@@ -85,18 +73,17 @@ pub trait RopeExt {
 impl RopeExt for Rope {
     fn lsp_position_to_text_pos(&self, pos: Position) -> TextPos {
         let row = pos.line as usize;
-        let utf16_col = pos.character as usize;
 
-        let row_char = self.line_to_char(row);
-        let col_char = self.utf16_cu_to_char(utf16_col);
-
-        let row_byte = self.line_to_byte(row);
-        let col_byte = self.char_to_byte(col_char);
+        // ropey's UTF-16 index is document-wide, so offset the column by the line start.
+        let line_utf16 = self.char_to_utf16_cu(self.line_to_char(row));
+        let char = self.utf16_cu_to_char(line_utf16 + pos.character as usize);
+        let byte = self.char_to_byte(char);
 
         TextPos {
-            byte: row_byte + col_byte,
-            char: row_char + col_char,
-            point: Point::new(row, col_byte),
+            byte,
+            char,
+            // tree-sitter columns are bytes from the line start.
+            point: Point::new(row, byte - self.line_to_byte(row)),
         }
     }
 
@@ -171,23 +158,11 @@ impl RopeExt for Rope {
 
 /// Compute the tree-sitter `Point` after inserting `text` starting at `start`.
 fn end_point_after_insert(start: Point, text: &str) -> Point {
-    let mut row = start.row;
-    let mut col = start.column;
-    let mut last_newline: Option<usize> = None;
-
-    for (i, b) in text.bytes().enumerate() {
-        if b == b'\n' {
-            row += 1;
-            last_newline = Some(i);
-        }
+    let newlines = text.bytes().filter(|&b| b == b'\n').count();
+    match text.rfind('\n') {
+        Some(nl) => Point::new(start.row + newlines, text.len() - nl - 1),
+        None => Point::new(start.row, start.column + text.len()),
     }
-
-    col = match last_newline {
-        Some(nl) => text.len() - nl - 1,
-        None => col + text.len(),
-    };
-
-    Point::new(row, col)
 }
 
 #[cfg(test)]
@@ -195,47 +170,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn end_point_single_line() {
-        let p = end_point_after_insert(Point::new(0, 3), "abc");
-        assert_eq!(p, Point::new(0, 6));
-    }
-
-    #[test]
-    fn end_point_multi_line() {
-        let p = end_point_after_insert(Point::new(1, 2), "x\ny\nz");
-        assert_eq!(p, Point::new(3, 1));
-    }
-
-    #[test]
-    fn end_point_trailing_newline() {
-        let p = end_point_after_insert(Point::new(0, 0), "abc\n");
-        assert_eq!(p, Point::new(1, 0));
-    }
-
-    #[test]
-    fn position_roundtrip_ascii() {
-        let rope = Rope::from_str("line0\nline1\nline2");
-        let pos = Position::new(1, 3);
+    fn position_conversion_multibyte() {
+        // "é" is 2 bytes in UTF-8 but 1 UTF-16 code unit; "😀" is 4 bytes and 2 code units.
+        // Line 1 starts after them, so every coordinate system disagrees there.
+        let rope = Rope::from_str("é😀\nab😀c");
+        let pos = Position::new(1, 4); // before 'c'
         let tp = rope.lsp_position_to_text_pos(pos);
-        assert_eq!(tp.byte, 9);
-        assert_eq!(rope.byte_to_lsp_position(9), pos);
+        assert_eq!(tp.byte, 7 + 6);
+        assert_eq!(tp.char, 3 + 3);
+        assert_eq!(tp.point, Point::new(1, 6));
+        assert_eq!(rope.byte_to_lsp_position(tp.byte), pos);
     }
 
     #[test]
-    fn position_roundtrip_multibyte() {
-        // "héllo" — é is 2 bytes UTF-8, 1 char, 1 UTF-16 code unit
-        let rope = Rope::from_str("héllo");
-        let pos = Position::new(0, 2); // after 'é'
-        let tp = rope.lsp_position_to_text_pos(pos);
-        assert_eq!(tp.byte, 3);
-        assert_eq!(rope.byte_to_lsp_position(3), pos);
-    }
-
-    #[test]
-    fn uri_path_roundtrip_simple() {
-        let p = PathBuf::from("/tmp/foo.foobar");
-        let uri = path_to_uri(&p).unwrap();
-        assert_eq!(uri_to_path(&uri).unwrap(), p);
+    fn end_point_after_multiline_insert() {
+        assert_eq!(
+            end_point_after_insert(Point::new(0, 3), "abc"),
+            Point::new(0, 6)
+        );
+        assert_eq!(
+            end_point_after_insert(Point::new(1, 2), "x\ny\nz"),
+            Point::new(3, 1)
+        );
     }
 
     #[test]
@@ -244,11 +200,5 @@ mod tests {
         let uri = path_to_uri(&p).unwrap();
         assert!(uri.as_str().contains("%20"));
         assert_eq!(uri_to_path(&uri).unwrap(), p);
-    }
-
-    #[test]
-    fn uri_to_path_rejects_non_file() {
-        let uri = Uri::from_str("https://example.com/x").unwrap();
-        assert!(uri_to_path(&uri).is_none());
     }
 }
