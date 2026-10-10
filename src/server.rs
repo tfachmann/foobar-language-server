@@ -14,8 +14,9 @@ use tower_lsp_server::ls_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
     InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf, Position,
-    Range, ReferenceParams, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Uri,
+    PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams, ServerCapabilities,
+    ServerInfo, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextEdit, Uri, WorkDoneProgressOptions, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing_subscriber::EnvFilter;
@@ -27,6 +28,7 @@ use crate::document::Document;
 use crate::format::Formatter;
 use crate::hover;
 use crate::references;
+use crate::rename;
 use crate::text::{RopeExt, uri_to_path};
 use crate::workspace::{Workspace, uri_key};
 
@@ -161,8 +163,10 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
-                // `(` of `%(` and `use t(`, `,` between arguments; `use ` completes when
-                // invoked or while typing the name.
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                })),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
                     ..CompletionOptions::default()
@@ -317,6 +321,24 @@ impl LanguageServer for Backend {
             &*doc.read().await,
             &params,
         ))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> RpcResult<Option<PrepareRenameResponse>> {
+        let Some(doc) = self.doc(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        Ok(rename::prepare(&*doc.read().await, &params))
+    }
+
+    async fn rename(&self, params: RenameParams) -> RpcResult<Option<WorkspaceEdit>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let Some(doc) = self.doc(uri) else {
+            return Ok(None);
+        };
+        rename::rename(&self.workspace, &*doc.read().await, &params)
     }
 
     async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {

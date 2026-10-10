@@ -2,8 +2,9 @@
 //!
 //! - defines (variables)
 //! - templates
+//! - template parameters (their template, plus argument names in calls)
 
-use tower_lsp_server::ls_types::{Location, Range, ReferenceParams};
+use tower_lsp_server::ls_types::{Location, Position, Range, ReferenceParams};
 use tree_sitter::Node;
 
 use crate::document::Document;
@@ -24,8 +25,24 @@ pub fn references(
     doc: &Document,
     params: &ReferenceParams,
 ) -> Option<Vec<Location>> {
-    let node = doc.node_at(params.text_document_position.position)?;
-    let declaration = params.context.include_declaration;
+    let pos = params.text_document_position.position;
+    find(workspace, doc, pos, params.context.include_declaration)
+}
+
+/// The identifier's range at `pos`, if it names a define, template or parameter.
+pub fn symbol_range(doc: &Document, pos: Position) -> Option<Range> {
+    let node = doc.node_at(pos)?;
+    target(doc, node).map(|_| doc.rope.node_range(node))
+}
+
+/// Every location naming the symbol at `pos`, sorted; `None` if the cursor is not on one.
+pub fn find(
+    workspace: &Workspace,
+    doc: &Document,
+    pos: Position,
+    declaration: bool,
+) -> Option<Vec<Location>> {
+    let node = doc.node_at(pos)?;
     let mut found: Vec<Location> = match target(doc, node)? {
         Target::Define(name) => workspace
             .all_files()
@@ -51,7 +68,18 @@ pub fn references(
                     .collect::<Vec<_>>()
             })
             .collect(),
-        Target::Param(template, name) => param_refs(doc, template, &name, declaration),
+        Target::Param(template, name) => {
+            let mut found = param_refs(doc, template, &name, declaration);
+            // Argument names in calls: `use t(name: ...)`.
+            let called = doc.rope.node_text(template.named_child(0)?);
+            found.extend(workspace.all_files().iter().flat_map(|file| {
+                let calls = file.symbols.uses.iter().filter(|u| u.name == called);
+                let args = calls.flat_map(|u| &u.args).filter(|(arg, _)| *arg == name);
+                args.map(|(_, range)| location(&file.uri, *range))
+                    .collect::<Vec<_>>()
+            }));
+            found
+        }
     };
     found.sort_by(|a, b| {
         let key = |l: &Location| (l.uri.as_str().to_owned(), l.range.start);
