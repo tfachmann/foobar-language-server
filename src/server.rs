@@ -108,6 +108,10 @@ impl Backend {
                 };
                 let mut diags = diagnostics::compute(&this.workspace, &snapshot);
                 diags.extend(diagnostics::surface_includes(&this.workspace, &snapshot));
+                // `abort()` can't stop the sync compute above; don't undo did_close's clear.
+                if doc.read().await.closed {
+                    return;
+                }
                 this.client
                     .publish_diagnostics(uri.clone(), diags, Some(version))
                     .await;
