@@ -122,7 +122,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dashmap",
- "percent-encoding",
  "ropey",
  "tempfile",
  "tokio",

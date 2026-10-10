@@ -1,4 +1,7 @@
-//! Per-document state: rope, parser, tree, symbol index.
+//! Per-document edit state: rope, parser, tree, and the snapshot published from them.
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ropey::Rope;
@@ -7,22 +10,27 @@ use tower_lsp_server::ls_types::{
 };
 use tree_sitter::{Node, Parser, Tree};
 
-use crate::symbol::SymbolIndex;
 use crate::text::RopeExt;
+use crate::workspace::{FileSnapshot, Origin, uri_key};
 
 /// Text handle and symbol information for a single Document.
 ///
 /// A document equals to one file.
 pub struct Document {
     pub uri: Uri,
+    /// Workspace map key, computed once at open so it stays stable while the file is saved,
+    /// renamed or deleted. `None` for non-`file://` buffers.
+    pub key: Option<PathBuf>,
     /// To track text invalidation.
     pub version: i32,
     /// Handle to text.
     pub rope: Rope,
     /// Parsed tree (symbol-agnostic).
     pub tree: Tree,
-    /// Parsed symbols.
-    pub symbols: SymbolIndex,
+    /// Symbols and parse errors of the latest parse; shared with other files via the workspace.
+    pub snapshot: Arc<FileSnapshot>,
+    /// Set by `did_close`. A `did_change` that arrives late must not touch a closed document.
+    pub closed: bool,
     /// Per-document [`Parser`].
     parser: Parser,
 }
@@ -39,14 +47,21 @@ impl Document {
         let tree = parser
             .parse(&item.text, None)
             .context("initial parse returned None")?;
-        let symbols = SymbolIndex::from_tree(&tree, &rope);
+        let snapshot = Arc::new(FileSnapshot::new(
+            item.uri.clone(),
+            Origin::Open,
+            &tree,
+            &rope,
+        ));
 
         Ok(Self {
+            key: uri_key(&item.uri),
             uri: item.uri,
             version: item.version,
             rope,
             tree,
-            symbols,
+            snapshot,
+            closed: false,
             parser,
         })
     }
@@ -77,7 +92,12 @@ impl Document {
             )
             .context("reparse returned None")?;
         self.tree = new_tree;
-        self.symbols = SymbolIndex::from_tree(&self.tree, &self.rope);
+        self.snapshot = Arc::new(FileSnapshot::new(
+            self.uri.clone(),
+            Origin::Open,
+            &self.tree,
+            &self.rope,
+        ));
         Ok(())
     }
 
@@ -152,16 +172,16 @@ mod tests {
             doc.tree.root_node().to_sexp(),
             fresh.tree.root_node().to_sexp()
         );
-        assert_eq!(doc.symbols.defines["greet"].value_text, "wörld");
-        assert!(doc.symbols.defines.contains_key("user"));
+        assert_eq!(doc.snapshot.symbols.defines["greet"].value_text, "wörld");
+        assert!(doc.snapshot.symbols.defines.contains_key("user"));
     }
 
     #[test]
     fn full_replace_without_range() {
         let mut doc = Document::from_text(uri(), "defines\na: \"1\"\n");
         change(&mut doc, None, "defines\nb: \"2\"\n");
-        assert!(doc.symbols.defines.contains_key("b"));
-        assert!(!doc.symbols.defines.contains_key("a"));
+        assert!(doc.snapshot.symbols.defines.contains_key("b"));
+        assert!(!doc.snapshot.symbols.defines.contains_key("a"));
     }
 
     /// Lines break at `\n`, `\r\n` and `\r` only (as in LSP), and positions clamp to the line end.

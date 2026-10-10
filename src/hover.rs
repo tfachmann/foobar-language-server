@@ -11,13 +11,13 @@ use tree_sitter::Node;
 use crate::document::Document;
 use crate::keywords::{keyword_doc, process_entry_key_doc};
 use crate::symbol::{TemplateDef, template_param};
-use crate::text::RopeExt;
-use crate::workspace::{Source, Workspace};
+use crate::text::{RopeExt, uri_to_path};
+use crate::workspace::{FileSnapshot, Origin, Workspace};
 
-pub async fn hover(workspace: &Workspace, doc: &Document, params: &HoverParams) -> Option<Hover> {
+pub fn hover(workspace: &Workspace, doc: &Document, params: &HoverParams) -> Option<Hover> {
     let pos = params.text_document_position_params.position;
     let node = doc.node_at(pos)?;
-    let md = render(workspace, doc, node).await?;
+    let md = render(workspace, doc, node)?;
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -27,7 +27,7 @@ pub async fn hover(workspace: &Workspace, doc: &Document, params: &HoverParams) 
     })
 }
 
-async fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<String> {
+fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<String> {
     // Case 1: keyword tokens. Anonymous, parent is the section node.
     if let Some(parent) = node.parent()
         && matches!(
@@ -42,7 +42,7 @@ async fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option
 
     // Case 2: hover on the (path) node of an include.
     if node.kind() == "path" && node.parent().is_some_and(|p| p.kind() == "include") {
-        return Some(hover_include_path(workspace, doc, node).await);
+        return Some(hover_include_path(workspace, doc, node));
     }
 
     match (node.kind(), node.parent().map(|p| p.kind())) {
@@ -52,7 +52,7 @@ async fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option
             if template_param(node, &doc.rope).is_some() {
                 return Some(format!("**{name}** - template parameter"));
             }
-            hover_variable_use(workspace, doc, &name).await
+            hover_variable_use(workspace, doc, &name)
         }
         // Case 4 / 5: identifier as an entry key.
         ("identifier", Some("entry")) => {
@@ -63,7 +63,7 @@ async fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option
                 .map(|s| s.kind() == "section_defines")
                 .unwrap_or(false);
             if in_defines {
-                hover_defines_key(workspace, doc, &name).await
+                hover_defines_key(workspace, doc, &name)
             } else {
                 hover_process_entry_key(&name)
             }
@@ -76,61 +76,55 @@ async fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option
         // Case 7: template name in its definition.
         ("identifier", Some("section_template")) => {
             let name = doc.rope.node_text(node);
-            let template = doc.symbols.templates.get(&name)?;
+            let template = doc.snapshot.symbols.templates.get(&name)?;
             Some(format!("**template** `{}`", signature(&name, template)))
         }
         // Case 8: template name in a `use` call.
         ("identifier", Some("use")) => {
             let name = doc.rope.node_text(node);
-            let (source, template) = workspace
-                .lookup_template(&doc.uri, &doc.symbols, &name)
-                .await?;
+            let (file, template) = workspace.lookup_template(&doc.snapshot, &name)?;
             Some(format!(
                 "**template** `{}`\n---\n{}",
                 signature(&name, &template),
-                location(doc, &source, template.name_range.start.line + 1),
+                location(doc, &file, template.name_range.start.line + 1),
             ))
         }
         _ => None,
     }
 }
 
-async fn hover_variable_use(workspace: &Workspace, doc: &Document, name: &str) -> Option<String> {
-    let (source, entry) = workspace
-        .lookup_define(&doc.uri, &doc.symbols, name)
-        .await?;
+fn hover_variable_use(workspace: &Workspace, doc: &Document, name: &str) -> Option<String> {
+    let (file, entry) = workspace.lookup_define(&doc.snapshot, name)?;
     Some(format!(
         "**{name}** = `{value}`\n---\n{location}",
         value = entry.value_text,
-        location = location(doc, &source, entry.key_range.start.line + 1),
+        location = location(doc, &file, entry.key_range.start.line + 1),
     ))
 }
 
-/// "defined at line N [in `file`]" for a symbol found at `source`.
-fn location(doc: &Document, source: &Source, line: u32) -> String {
-    match source {
-        Source::OpenDoc(uri) if uri == &doc.uri => format!("defined at line {line}"),
-        Source::OpenDoc(uri) => {
-            let file = uri.as_str().rsplit('/').next().unwrap_or(uri.as_str());
-            format!("defined at line {line} in `{file}` (open)")
-        }
-        Source::Disk(path) => {
-            let file = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("<unknown>");
-            format!("defined at line {line} in `{file}`")
-        }
+/// "defined at line N [in `file`]" for a symbol found in `file`.
+fn location(doc: &Document, file: &FileSnapshot, line: u32) -> String {
+    if file.uri == doc.uri {
+        return format!("defined at line {line}");
     }
+    // Decoded path, so `my file.foobar` does not show as `my%20file.foobar`.
+    let path = uri_to_path(&file.uri).unwrap_or_default();
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let open = if file.origin == Origin::Open {
+        " (open)"
+    } else {
+        ""
+    };
+    format!("defined at line {line} in `{name}`{open}")
 }
 
 fn signature(name: &str, template: &TemplateDef) -> String {
     format!("{name}({})", template.params.join(", "))
 }
 
-async fn hover_defines_key(workspace: &Workspace, doc: &Document, name: &str) -> Option<String> {
-    let entry = doc.symbols.defines.get(name)?;
-    let n = workspace.count_refs(name).await;
+fn hover_defines_key(workspace: &Workspace, doc: &Document, name: &str) -> Option<String> {
+    let entry = doc.snapshot.symbols.defines.get(name)?;
+    let n = workspace.count_refs(name);
     let usage = match n {
         0 => "_unused_".to_string(),
         1 => "_used 1 time_".to_string(),
@@ -143,7 +137,12 @@ async fn hover_defines_key(workspace: &Workspace, doc: &Document, name: &str) ->
 }
 
 fn hover_process_header(doc: &Document, name: &str) -> Option<String> {
-    let p = doc.symbols.processes.iter().find(|p| p.name == name)?;
+    let p = doc
+        .snapshot
+        .symbols
+        .processes
+        .iter()
+        .find(|p| p.name == name)?;
     Some(format!(
         "**process** `{name}` ({n} entr{plural})",
         name = name,
@@ -158,7 +157,7 @@ fn hover_process_entry_key(name: &str) -> Option<String> {
         .or_else(|| Some(format!("**{name}** - process entry key (no documentation)")))
 }
 
-async fn hover_include_path(workspace: &Workspace, doc: &Document, node: Node<'_>) -> String {
+fn hover_include_path(workspace: &Workspace, doc: &Document, node: Node<'_>) -> String {
     let raw = doc.rope.node_text(node).trim().to_string();
     let resolved = workspace.resolve(&doc.uri, &raw);
     let mut body = format!("**include** `{raw}`\n---\n");
@@ -167,7 +166,7 @@ async fn hover_include_path(workspace: &Workspace, doc: &Document, node: Node<'_
             body.push_str(&format!("Resolved to `{}`\n---\n", r.path.display()));
             if !r.exists {
                 body.push_str("_file not found_");
-            } else if let Some(n) = workspace.defines_count_at(&r.path).await {
+            } else if let Some(n) = workspace.defines_count_at(&r.path) {
                 body.push_str(&format!("_{n} define{}_", if n == 1 { "" } else { "s" }));
             } else {
                 body.push_str("_file found_");
@@ -192,7 +191,7 @@ mod tests {
 
     use crate::text::path_to_uri;
 
-    async fn hover_at(ws: &Workspace, doc: &Document, line: u32, character: u32) -> Option<String> {
+    fn hover_at(ws: &Workspace, doc: &Document, line: u32, character: u32) -> Option<String> {
         let params = HoverParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
@@ -202,7 +201,7 @@ mod tests {
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        hover(ws, doc, &params).await.map(|h| match h.contents {
+        hover(ws, doc, &params).map(|h| match h.contents {
             HoverContents::Markup(m) => m.value,
             _ => String::new(),
         })
@@ -210,23 +209,23 @@ mod tests {
 
     const SRC: &str = "defines\nfile_name: \"slides\"\n\nprocess compile presentation\ncommand: \"%(file_name).typ\"\n";
 
-    #[tokio::test]
-    async fn hover_on_keyword() {
+    #[test]
+    fn hover_on_keyword() {
         let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), SRC);
-        let s = hover_at(&Workspace::default(), &doc, 3, 2).await.unwrap();
+        let s = hover_at(&Workspace::default(), &doc, 3, 2).unwrap();
         assert!(s.starts_with("**process**"), "got: {s}");
     }
 
-    #[tokio::test]
-    async fn hover_on_variable_use() {
+    #[test]
+    fn hover_on_variable_use() {
         let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), SRC);
         // Inside `file_name` of `%(file_name)`.
-        let s = hover_at(&Workspace::default(), &doc, 4, 14).await.unwrap();
+        let s = hover_at(&Workspace::default(), &doc, 4, 14).unwrap();
         assert_eq!(s, "**file_name** = `slides`\n---\ndefined at line 2");
     }
 
-    #[tokio::test]
-    async fn hover_on_include_path() {
+    #[test]
+    fn hover_on_include_path() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("inc.foobar"),
@@ -236,9 +235,9 @@ mod tests {
         let main_uri = path_to_uri(&dir.path().join("main.foobar")).unwrap();
         let doc = Document::from_text(main_uri, "include inc.foobar\n");
         let ws = Workspace::default();
-        ws.refresh_includes_for(&doc).await;
+        ws.refresh_includes_for(&doc.snapshot);
 
-        let s = hover_at(&ws, &doc, 0, 10).await.unwrap();
+        let s = hover_at(&ws, &doc, 0, 10).unwrap();
         assert!(s.contains("_2 defines_"), "got: {s}");
     }
 }

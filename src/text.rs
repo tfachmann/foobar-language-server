@@ -1,45 +1,24 @@
 //! LSP UTF-16 <-> rope char <-> rope byte <-> tree-sitter Point conversion.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
-use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use ropey::{Rope, RopeSlice};
 use tower_lsp_server::ls_types::{Position, Range, TextDocumentContentChangeEvent, Uri};
 use tree_sitter::{InputEdit, Node, Point};
 
 /// Convert a `file://` URI into a filesystem path. `None` for other schemes.
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
-    let s = uri.as_str();
-    let rest = s.strip_prefix("file://")?;
-    let path_part = match rest.find('/') {
-        Some(0) => rest,
-        Some(slash) => &rest[slash..],
-        None => return None,
-    };
-    let decoded = percent_decode_str(path_part).decode_utf8().ok()?;
-    Some(PathBuf::from(decoded.as_ref()))
+    // `to_file_path` ignores the scheme, so check it first.
+    if !uri.scheme().as_str().eq_ignore_ascii_case("file") {
+        return None;
+    }
+    uri.to_file_path().map(Cow::into_owned)
 }
 
 /// Build a `file://` URI from an absolute filesystem path.
 pub fn path_to_uri(path: &Path) -> Option<Uri> {
-    let p = path.to_str()?;
-    if !p.starts_with('/') {
-        return None;
-    }
-    // Encode the path component; keep '/' separator.
-    const SAFE: &AsciiSet = &CONTROLS
-        .add(b' ')
-        .add(b'"')
-        .add(b'#')
-        .add(b'<')
-        .add(b'>')
-        .add(b'?')
-        .add(b'`')
-        .add(b'{')
-        .add(b'}');
-    let encoded: String = utf8_percent_encode(p, SAFE).collect();
-    Uri::from_str(&format!("file://{encoded}")).ok()
+    Uri::from_file_path(path)
 }
 
 /// Coordinates of a single position, expressed in every system we care about.
@@ -208,10 +187,10 @@ mod tests {
     }
 
     #[test]
-    fn uri_path_roundtrip_with_space() {
-        let p = PathBuf::from("/tmp/has space/bar.foobar");
+    fn uri_path_roundtrip_with_space_and_percent() {
+        let p = PathBuf::from("/tmp/has space/100%.foobar");
         let uri = path_to_uri(&p).unwrap();
-        assert!(uri.as_str().contains("%20"));
+        assert!(uri.as_str().ends_with("/has%20space/100%25.foobar"));
         assert_eq!(uri_to_path(&uri).unwrap(), p);
     }
 }

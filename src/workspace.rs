@@ -1,8 +1,7 @@
-//! Shared workspace state
-//! - open documents
-//! - disk cache of included files
+//! Shared workspace state: one immutable snapshot per known file, plus the include graph.
 //!
-//! Handles transitive symbol lookup with cycle detection.
+//! Open buffers and files read from disk share the same map, so every cross-file lookup is
+//! plain synchronous code that never touches a document lock.
 
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
@@ -13,28 +12,43 @@ use std::time::SystemTime;
 
 use dashmap::DashMap;
 use ropey::Rope;
-use tokio::sync::RwLock;
 use tower_lsp_server::ls_types::{Diagnostic, Uri};
-use tree_sitter::Parser;
+use tree_sitter::{Parser, Tree};
 
 use crate::diagnostics::collect_parse_errors;
 use crate::document::Document;
 use crate::symbol::{DefineEntry, IncludeRef, SymbolIndex, TemplateDef};
 use crate::text::{path_to_uri, uri_to_path};
 
-/// One file that the LSP knows about via the filesystem (not opened in the editor).
-pub struct DiskFile {
-    pub mtime: Option<SystemTime>,
+/// What other files may know about a file. Replaced as a whole after every parse.
+pub struct FileSnapshot {
+    /// The editor's URI for open buffers, one built from the path for disk files.
+    pub uri: Uri,
+    pub origin: Origin,
     pub symbols: SymbolIndex,
-    /// Parse errors precomputed at load time.
     pub parse_diags: Vec<Diagnostic>,
 }
 
-/// Where a symbol was found.
-#[derive(Clone, Debug)]
-pub enum Source {
-    OpenDoc(Uri),
-    Disk(PathBuf),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// An editor buffer. Authoritative: never replaced by the disk version while open.
+    Open,
+    Disk {
+        mtime: Option<SystemTime>,
+    },
+}
+
+impl FileSnapshot {
+    pub fn new(uri: Uri, origin: Origin, tree: &Tree, rope: &Rope) -> Self {
+        let mut parse_diags = Vec::new();
+        collect_parse_errors(tree, rope, &mut parse_diags);
+        Self {
+            uri,
+            origin,
+            symbols: SymbolIndex::from_tree(tree, rope),
+            parse_diags,
+        }
+    }
 }
 
 /// Outcome of resolving a raw include path.
@@ -49,58 +63,127 @@ pub struct ResolvedInclude {
 /// A file reached by following `include`s.
 pub struct Reached {
     pub path: PathBuf,
-    /// Snapshot of the file's symbols. `None` if the file is missing or unreadable.
-    pub file: Option<(Source, SymbolIndex)>,
+    /// `None` if the file is missing or unreadable.
+    pub file: Option<Arc<FileSnapshot>>,
 }
 
-/// Open documents, disk-cached included files, and the include graph between them.
 #[derive(Default)]
 pub struct Workspace {
-    /// Files open in the editor (via LSP).
-    pub docs: DashMap<Uri, Arc<RwLock<Document>>>,
-    /// Cache of files read from disk (not currently open in the editor).
-    pub disk: DashMap<PathBuf, Arc<DiskFile>>,
+    /// Every known file by [`file_key`]: open buffers and files read from disk.
+    pub files: DashMap<PathBuf, Arc<FileSnapshot>>,
     /// Reverse include graph: file path -> open docs that (transitively) include it.
     pub dependents: DashMap<PathBuf, HashSet<Uri>>,
     /// Workspace root directories captured at LSP `initialize`.
     pub roots: OnceLock<Vec<PathBuf>>,
 }
 
+/// The single map key for a file: its canonical path.
+///
+/// A file that doesn't exist yet (new, unsaved) gets its canonical directory plus its name, so the
+/// key stays the same once the file is saved.
+pub fn file_key(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    match (
+        path.parent().and_then(|d| d.canonicalize().ok()),
+        path.file_name(),
+    ) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// [`file_key`] for a `file://` URI.
+pub fn uri_key(uri: &Uri) -> Option<PathBuf> {
+    uri_to_path(uri).map(|p| file_key(&p))
+}
+
 impl Workspace {
     pub fn set_roots(&self, roots: Vec<PathBuf>) {
-        let _ = self.roots.set(roots);
+        let _ = self.roots.set(roots.iter().map(|r| file_key(r)).collect());
     }
 
-    /// The open document for `uri`.
+    /// Is `key` inside one of the workspace roots?
+    fn in_roots(&self, key: &Path) -> bool {
+        self.roots
+            .get()
+            .is_some_and(|roots| roots.iter().any(|r| key.starts_with(r)))
+    }
+
+    /// The snapshot for `path`. Clones the `Arc` so no DashMap guard outlives the call.
+    pub fn file(&self, path: &Path) -> Option<Arc<FileSnapshot>> {
+        self.files.get(path).map(|e| e.value().clone())
+    }
+
+    /// All snapshots, cloned out of the map so callers can load files while iterating.
+    fn all_files(&self) -> Vec<Arc<FileSnapshot>> {
+        self.files.iter().map(|e| e.value().clone()).collect()
+    }
+
+    /// Make an open buffer's latest parse visible to other files.
     ///
-    /// Clones the `Arc` out of the map so no DashMap shard guard is held across a later `.await`.
-    pub fn doc(&self, uri: &Uri) -> Option<Arc<RwLock<Document>>> {
-        self.docs.get(uri).map(|e| e.value().clone())
+    /// Call while holding the document's write lock so snapshots land in edit order.
+    pub fn publish(&self, doc: &Document) {
+        if let Some(key) = &doc.key {
+            self.files.insert(key.clone(), doc.snapshot.clone());
+        }
     }
 
-    /// The open document whose canonical path equals `path`, if any.
-    pub fn doc_at(&self, path: &Path) -> Option<Arc<RwLock<Document>>> {
-        self.docs
-            .iter()
-            .find(|e| {
-                uri_to_path(e.key())
-                    .and_then(|p| p.canonicalize().ok())
-                    .as_deref()
-                    == Some(path)
-            })
-            .map(|e| e.value().clone())
+    /// The editor closed `doc`: drop it from the include graph and fall back to the disk version.
+    pub fn close(&self, doc: &Document) {
+        let Some(key) = &doc.key else {
+            return;
+        };
+        // Only remove our own snapshot: a quick reopen or a second alias may own the entry by now.
+        if self
+            .files
+            .remove_if(key, |_, f| Arc::ptr_eq(f, &doc.snapshot))
+            .is_none()
+        {
+            return;
+        }
+        self.forget_doc(&doc.uri);
+        // Files outside the roots were never part of the pool; don't add them now.
+        if self.in_roots(key) {
+            self.load(key);
+        }
     }
 
-    /// Recursively walk every stored root, parsing each `*.foobar` file into `self.disk`.
+    /// Recursively walk every stored root, loading each `*.foobar` file.
     pub fn scan_workspace(&self) {
         let Some(roots) = self.roots.get() else {
             return;
         };
         for path in walk_foobar_files(roots) {
-            if self.doc_at(&path).is_none() {
-                self.load_if_stale(&path);
-            }
+            self.load(&file_key(&path));
         }
+    }
+
+    /// The snapshot for `path`, (re)read from disk unless it is open or the cached copy is current.
+    fn load(&self, path: &Path) -> Option<Arc<FileSnapshot>> {
+        let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+        if let Some(cached) = self.file(path)
+            && (cached.origin == Origin::Open || cached.origin == Origin::Disk { mtime })
+        {
+            return Some(cached);
+        }
+        // Read and parse outside the map; the file may get opened meanwhile.
+        let Some(fresh) = load_disk_file(path, mtime).map(Arc::new) else {
+            // Deleted or unreadable: forget the cached copy, but never an open buffer.
+            self.files.remove_if(path, |_, f| f.origin != Origin::Open);
+            return None;
+        };
+        let entry = self
+            .files
+            .entry(path.to_path_buf())
+            .and_modify(|e| {
+                if e.origin != Origin::Open {
+                    *e = fresh.clone();
+                }
+            })
+            .or_insert(fresh);
+        Some(entry.value().clone())
     }
 
     /// Resolve a raw include path string against a base `file://` URI.
@@ -108,17 +191,15 @@ impl Workspace {
     /// Returns `None` for non-file base URIs.
     pub fn resolve(&self, base: &Uri, raw: &str) -> Option<ResolvedInclude> {
         let base_path = uri_to_path(base)?;
-        let joined = base_path.parent()?.join(raw.trim());
-        let path = joined.canonicalize().unwrap_or(joined);
+        let path = file_key(&base_path.parent()?.join(raw.trim()));
         let exists = path.exists();
         Some(ResolvedInclude { path, exists })
     }
 
     /// Breadth-first walk over everything transitively included from `base`.
     ///
-    /// Open documents win over the disk cache; stale or missing cache entries are (re)loaded.
     /// Each path is visited once, so include cycles terminate.
-    pub async fn reachable(&self, base: &Uri, includes: &[IncludeRef]) -> Vec<Reached> {
+    pub fn reachable(&self, base: &Uri, includes: &[IncludeRef]) -> Vec<Reached> {
         let mut out: Vec<Reached> = Vec::new();
         let mut visited: HashSet<PathBuf> = HashSet::new();
         let mut queue: VecDeque<(Uri, Vec<IncludeRef>)> = VecDeque::new();
@@ -132,21 +213,10 @@ impl Workspace {
                 if !visited.insert(resolved.path.clone()) {
                     continue;
                 }
-                let file = if !resolved.exists {
-                    None
-                } else if let Some(doc) = self.doc_at(&resolved.path) {
-                    let doc = doc.read().await;
-                    Some((Source::OpenDoc(doc.uri.clone()), doc.symbols.clone()))
-                } else {
-                    self.load_if_stale(&resolved.path)
-                        .map(|f| (Source::Disk(resolved.path.clone()), f.symbols.clone()))
-                };
-                if let Some((source, symbols)) = &file {
-                    let next_base = match source {
-                        Source::OpenDoc(uri) => Some(uri.clone()),
-                        Source::Disk(path) => path_to_uri(path),
-                    };
-                    queue.push_back((next_base.unwrap_or(base.clone()), symbols.includes.clone()));
+                // Also for missing files: evicts a deleted file's stale snapshot.
+                let file = self.load(&resolved.path);
+                if let Some(f) = &file {
+                    queue.push_back((f.uri.clone(), f.symbols.includes.clone()));
                 }
                 out.push(Reached {
                     path: resolved.path,
@@ -157,15 +227,15 @@ impl Workspace {
         out
     }
 
-    /// Load all transitive includes of `doc` into the disk cache and record `doc` as their dependent.
-    pub async fn refresh_includes_for(&self, doc: &Document) {
-        let reached = self.reachable(&doc.uri, &doc.symbols.includes).await;
-        self.forget_doc(&doc.uri);
+    /// Load all transitive includes of an open file and record it as their dependent.
+    pub fn refresh_includes_for(&self, snapshot: &FileSnapshot) {
+        let reached = self.reachable(&snapshot.uri, &snapshot.symbols.includes);
+        self.forget_doc(&snapshot.uri);
         for r in reached {
             self.dependents
                 .entry(r.path)
                 .or_default()
-                .insert(doc.uri.clone());
+                .insert(snapshot.uri.clone());
         }
     }
 
@@ -185,143 +255,92 @@ impl Workspace {
             .unwrap_or_default()
     }
 
-    /// Return the cached `DiskFile` for `path`, re-reading it if missing or modified on disk.
-    fn load_if_stale(&self, path: &Path) -> Option<Arc<DiskFile>> {
-        let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
-        if let Some(cached) = self.disk.get(path)
-            && cached.mtime == mtime
-        {
-            return Some(cached.clone());
-        }
-        let loaded = Arc::new(load_disk_file(path, mtime)?);
-        self.disk.insert(path.to_path_buf(), loaded.clone());
-        Some(loaded)
-    }
-
-    /// Search `local` first, then everything it transitively includes.
+    /// Search `from` first, then everything it transitively includes.
     ///
     /// `pick` extracts the wanted symbol from one file's index.
-    pub async fn lookup<T>(
+    pub fn lookup<T>(
         &self,
-        base: &Uri,
-        local: &SymbolIndex,
+        from: &Arc<FileSnapshot>,
         pick: impl Fn(&SymbolIndex) -> Option<T>,
-    ) -> Option<(Source, T)> {
-        if let Some(hit) = pick(local) {
-            return Some((Source::OpenDoc(base.clone()), hit));
+    ) -> Option<(Arc<FileSnapshot>, T)> {
+        if let Some(hit) = pick(&from.symbols) {
+            return Some((from.clone(), hit));
         }
-        self.reachable(base, &local.includes)
-            .await
+        self.reachable(&from.uri, &from.symbols.includes)
             .into_iter()
             .find_map(|r| {
-                let (source, symbols) = r.file?;
-                Some((source, pick(&symbols)?))
+                let file = r.file?;
+                let hit = pick(&file.symbols)?;
+                Some((file, hit))
             })
     }
 
-    /// Search every open and disk-cached file, whether it is included or not.
-    pub async fn lookup_anywhere<T>(
+    /// Search every known file, whether it is included or not.
+    pub fn lookup_anywhere<T>(
         &self,
         pick: impl Fn(&SymbolIndex) -> Option<T>,
-    ) -> Option<(Source, T)> {
-        let doc_arcs: Vec<Arc<RwLock<Document>>> =
-            self.docs.iter().map(|e| e.value().clone()).collect();
-        for doc_arc in doc_arcs {
-            let doc = doc_arc.read().await;
-            if let Some(hit) = pick(&doc.symbols) {
-                return Some((Source::OpenDoc(doc.uri.clone()), hit));
-            }
-        }
-        self.disk.iter().find_map(|e| {
-            let hit = pick(&e.value().symbols)?;
-            Some((Source::Disk(e.key().clone()), hit))
+    ) -> Option<(Arc<FileSnapshot>, T)> {
+        self.all_files().into_iter().find_map(|file| {
+            let hit = pick(&file.symbols)?;
+            Some((file, hit))
         })
     }
 
     /// The define for `name`, from the file itself or its transitive includes.
-    pub async fn lookup_define(
+    pub fn lookup_define(
         &self,
-        base: &Uri,
-        local: &SymbolIndex,
+        from: &Arc<FileSnapshot>,
         name: &str,
-    ) -> Option<(Source, DefineEntry)> {
-        self.lookup(base, local, |s| s.defines.get(name).cloned())
-            .await
+    ) -> Option<(Arc<FileSnapshot>, DefineEntry)> {
+        self.lookup(from, |s| s.defines.get(name).cloned())
     }
 
     /// Does `name` resolve via [`Self::lookup_define`] or anywhere else in the workspace?
-    pub async fn has_define(&self, base: &Uri, local: &SymbolIndex, name: &str) -> bool {
+    pub fn has_define(&self, from: &Arc<FileSnapshot>, name: &str) -> bool {
         let pick = |s: &SymbolIndex| s.defines.get(name).map(|_| ());
-        self.lookup(base, local, pick).await.is_some() || self.lookup_anywhere(pick).await.is_some()
+        self.lookup(from, pick).is_some() || self.lookup_anywhere(pick).is_some()
     }
 
     /// The template `name`, from the file itself, its includes, or anywhere in the workspace.
-    pub async fn lookup_template(
+    pub fn lookup_template(
         &self,
-        base: &Uri,
-        local: &SymbolIndex,
+        from: &Arc<FileSnapshot>,
         name: &str,
-    ) -> Option<(Source, TemplateDef)> {
+    ) -> Option<(Arc<FileSnapshot>, TemplateDef)> {
         let pick = |s: &SymbolIndex| s.templates.get(name).cloned();
-        match self.lookup(base, local, pick).await {
-            Some(hit) => Some(hit),
-            None => self.lookup_anywhere(pick).await,
-        }
+        self.lookup(from, pick)
+            .or_else(|| self.lookup_anywhere(pick))
     }
 
     /// Workspace-wide count of `%(name)` references.
-    pub async fn count_refs(&self, name: &str) -> usize {
-        let count =
-            |symbols: &SymbolIndex| symbols.var_refs.iter().filter(|(k, _)| k == name).count();
-
-        let mut n = 0;
-        let mut doc_paths: HashSet<PathBuf> = HashSet::new();
-        let doc_arcs: Vec<Arc<RwLock<Document>>> =
-            self.docs.iter().map(|e| e.value().clone()).collect();
-        for doc_arc in doc_arcs {
-            let doc = doc_arc.read().await;
-            n += count(&doc.symbols);
-            if let Some(p) = uri_to_path(&doc.uri).and_then(|p| p.canonicalize().ok()) {
-                doc_paths.insert(p);
-            }
-        }
-        // Open buffers shadow their on-disk copy.
-        n + self
-            .disk
+    pub fn count_refs(&self, name: &str) -> usize {
+        self.all_files()
             .iter()
-            .filter(|e| !doc_paths.contains(e.key()))
-            .map(|e| count(&e.value().symbols))
-            .sum::<usize>()
+            .flat_map(|f| &f.symbols.var_refs)
+            .filter(|(k, _)| k == name)
+            .count()
     }
 
-    /// Number of defines in a resolved include target (open doc first, then disk).
-    ///
-    /// Returns `None` if the file isn't loaded (neither open nor cached).
-    pub async fn defines_count_at(&self, path: &Path) -> Option<usize> {
-        if let Some(doc) = self.doc_at(path) {
-            return Some(doc.read().await.symbols.defines.len());
-        }
-        self.disk.get(path).map(|f| f.symbols.defines.len())
+    /// Number of defines in a known file. `None` if the file isn't loaded.
+    pub fn defines_count_at(&self, path: &Path) -> Option<usize> {
+        self.file(path).map(|f| f.symbols.defines.len())
     }
 }
 
 /// Read + parse + index a file from disk. `None` on any IO/parse failure.
-fn load_disk_file(path: &Path, mtime: Option<SystemTime>) -> Option<DiskFile> {
+fn load_disk_file(path: &Path, mtime: Option<SystemTime>) -> Option<FileSnapshot> {
     let text = fs::read_to_string(path).ok()?;
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_foobar::LANGUAGE.into())
         .ok()?;
     let tree = parser.parse(&text, None)?;
-    let rope = Rope::from_str(&text);
-    let symbols = SymbolIndex::from_tree(&tree, &rope);
-    let mut parse_diags = Vec::new();
-    collect_parse_errors(&tree, &rope, &mut parse_diags);
-    Some(DiskFile {
-        mtime,
-        symbols,
-        parse_diags,
-    })
+    Some(FileSnapshot::new(
+        path_to_uri(path)?,
+        Origin::Disk { mtime },
+        &tree,
+        &Rope::from_str(&text),
+    ))
 }
 
 /// Iterative DFS over `roots`, returning every `*.foobar` file found.
@@ -373,54 +392,92 @@ fn walk_foobar_files(roots: &[PathBuf]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::Document;
     use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn open_doc_preferred_over_disk() {
+    #[test]
+    fn open_buffer_wins_until_closed() {
         let ws = Workspace::default();
         let dir = TempDir::new().unwrap();
         let inc_path = dir.path().join("inc.foobar");
         let main_path = dir.path().join("main.foobar");
         fs::write(&inc_path, "defines\nname: \"disk\"\n").unwrap();
         fs::write(&main_path, "include inc.foobar\n").unwrap();
+        let main = Document::from_text(path_to_uri(&main_path).unwrap(), "include inc.foobar\n");
+        let name = |ws: &Workspace| {
+            let (file, entry) = ws.lookup_define(&main.snapshot, "name").unwrap();
+            (entry.value_text, file.origin == Origin::Open)
+        };
 
-        // inc.foobar is open with unsaved edits that differ from disk.
+        // inc.foobar is open with unsaved edits. A workspace scan must not replace them.
         let inc_uri = path_to_uri(&inc_path).unwrap();
-        let inc_doc = Document::from_text(inc_uri, "defines\nname: \"buffer\"\n");
-        ws.docs
-            .insert(inc_doc.uri.clone(), Arc::new(RwLock::new(inc_doc)));
+        let inc = Document::from_text(inc_uri.clone(), "defines\nname: \"buffer\"\n");
+        ws.publish(&inc);
+        ws.set_roots(vec![dir.path().to_path_buf()]);
+        ws.scan_workspace();
+        assert_eq!(name(&ws), ("buffer".to_string(), true));
 
-        let main_doc =
-            Document::from_text(path_to_uri(&main_path).unwrap(), "include inc.foobar\n");
-        let (source, entry) = ws
-            .lookup_define(&main_doc.uri, &main_doc.symbols, "name")
-            .await
-            .unwrap();
-        assert_eq!(entry.value_text, "buffer");
-        assert!(matches!(source, Source::OpenDoc(_)));
+        // Quick close + reopen: closing the old document must not drop the reopened buffer.
+        let reopened = Document::from_text(inc_uri, "defines\nname: \"reopened\"\n");
+        ws.publish(&reopened);
+        ws.close(&inc);
+        assert_eq!(name(&ws), ("reopened".to_string(), true));
+
+        // Closing the buffer falls back to the file on disk.
+        ws.close(&reopened);
+        assert_eq!(name(&ws), ("disk".to_string(), false));
     }
 
-    #[tokio::test]
-    async fn dependents_follow_edits() {
+    #[test]
+    fn closed_and_deleted_files_leave_the_pool() {
+        let ws = Workspace::default();
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        ws.set_roots(vec![root.path().to_path_buf()]);
+
+        // A file outside the roots is forgotten when its buffer closes.
+        let scratch = outside.path().join("scratch.foobar");
+        fs::write(&scratch, "defines\nfoo: \"1\"\n").unwrap();
+        let doc = Document::from_text(path_to_uri(&scratch).unwrap(), "defines\nfoo: \"1\"\n");
+        ws.publish(&doc);
+        ws.close(&doc);
+        assert!(ws.files.is_empty());
+
+        // A deleted include is evicted the next time the include graph is walked.
+        let inc = root.path().join("inc.foobar");
+        fs::write(&inc, "defines\nx: \"1\"\n").unwrap();
+        let main = Document::from_text(
+            path_to_uri(&root.path().join("main.foobar")).unwrap(),
+            "include inc.foobar\n",
+        );
+        ws.refresh_includes_for(&main.snapshot);
+        assert_eq!(ws.files.len(), 1);
+        fs::remove_file(&inc).unwrap();
+        ws.refresh_includes_for(&main.snapshot);
+        assert!(ws.files.is_empty());
+    }
+
+    #[test]
+    fn dependents_follow_edits() {
         let ws = Workspace::default();
         let dir = TempDir::new().unwrap();
         let inc_path = dir.path().join("inc.foobar");
         fs::write(&inc_path, "defines\nx: \"1\"\n").unwrap();
-        let inc_canon = inc_path.canonicalize().unwrap();
+        let inc_key = file_key(&inc_path);
         let main_uri = path_to_uri(&dir.path().join("main.foobar")).unwrap();
 
         let v1 = Document::from_text(main_uri.clone(), "include inc.foobar\n");
-        ws.refresh_includes_for(&v1).await;
-        assert_eq!(ws.dependents_of(&inc_canon), vec![main_uri.clone()]);
+        ws.refresh_includes_for(&v1.snapshot);
+        assert_eq!(ws.dependents_of(&inc_key), vec![main_uri.clone()]);
 
         // The include is removed: inc.foobar no longer has main as a dependent.
         let v2 = Document::from_text(main_uri, "defines\ny: \"2\"\n");
-        ws.refresh_includes_for(&v2).await;
-        assert!(ws.dependents_of(&inc_canon).is_empty());
+        ws.refresh_includes_for(&v2.snapshot);
+        assert!(ws.dependents_of(&inc_key).is_empty());
     }
 
-    #[tokio::test]
-    async fn has_define_falls_back_to_workspace_pool() {
+    #[test]
+    fn has_define_falls_back_to_workspace_pool() {
         let ws = Workspace::default();
         let dir = TempDir::new().unwrap();
         // b.foobar uses %(foo) without including a.foobar, which defines it.
@@ -433,8 +490,8 @@ mod tests {
         ws.set_roots(vec![dir.path().to_path_buf()]);
         ws.scan_workspace();
 
-        assert!(ws.has_define(&b.uri, &b.symbols, "foo").await);
-        assert!(!ws.has_define(&b.uri, &b.symbols, "ghost").await);
+        assert!(ws.has_define(&b.snapshot, "foo"));
+        assert!(!ws.has_define(&b.snapshot, "ghost"));
     }
 
     #[test]
@@ -449,8 +506,10 @@ mod tests {
         ws.set_roots(vec![dir.path().to_path_buf()]);
         ws.scan_workspace();
 
-        let nested = dir.path().join("nested/x.foobar").canonicalize().unwrap();
-        assert_eq!(ws.disk.len(), 1);
-        assert!(ws.disk.contains_key(&nested));
+        assert_eq!(ws.files.len(), 1);
+        assert!(
+            ws.files
+                .contains_key(&file_key(&dir.path().join("nested/x.foobar")))
+        );
     }
 }

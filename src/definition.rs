@@ -10,9 +10,9 @@ use tower_lsp_server::ls_types::{GotoDefinitionParams, GotoDefinitionResponse, L
 use crate::document::Document;
 use crate::symbol::template_param;
 use crate::text::{RopeExt, path_to_uri};
-use crate::workspace::{Source, Workspace};
+use crate::workspace::Workspace;
 
-pub async fn goto(
+pub fn goto(
     workspace: &Workspace,
     doc: &Document,
     params: &GotoDefinitionParams,
@@ -31,20 +31,21 @@ pub async fn goto(
             }));
         }
         let name = doc.rope.node_text(node);
-        let (source, entry) = workspace
-            .lookup_define(&doc.uri, &doc.symbols, &name)
-            .await?;
-        return source_to_location(&source, entry.key_range).map(GotoDefinitionResponse::Scalar);
+        let (file, entry) = workspace.lookup_define(&doc.snapshot, &name)?;
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: file.uri.clone(),
+            range: entry.key_range,
+        }));
     }
 
     // Template call: `use name(...)` -> template definition.
     if node.kind() == "identifier" && parent_kind == Some("use") {
         let name = doc.rope.node_text(node);
-        let (source, template) = workspace
-            .lookup_template(&doc.uri, &doc.symbols, &name)
-            .await?;
-        return source_to_location(&source, template.name_range)
-            .map(GotoDefinitionResponse::Scalar);
+        let (file, template) = workspace.lookup_template(&doc.snapshot, &name)?;
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: file.uri.clone(),
+            range: template.name_range,
+        }));
     }
 
     // Include path: `include some_other.foobar` -> file start.
@@ -54,7 +55,11 @@ pub async fn goto(
         if !resolved.exists {
             return None;
         }
-        let uri = path_to_uri(&resolved.path)?;
+        // Prefer the editor's URI if the file is open.
+        let uri = match workspace.file(&resolved.path) {
+            Some(file) => file.uri.clone(),
+            None => path_to_uri(&resolved.path)?,
+        };
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri,
             range: Range::default(),
@@ -62,16 +67,6 @@ pub async fn goto(
     }
 
     None
-}
-
-fn source_to_location(source: &Source, range: Range) -> Option<Location> {
-    match source {
-        Source::OpenDoc(uri) => Some(Location {
-            uri: uri.clone(),
-            range,
-        }),
-        Source::Disk(path) => path_to_uri(path).map(|uri| Location { uri, range }),
-    }
 }
 
 #[cfg(test)]
@@ -85,7 +80,7 @@ mod tests {
         WorkDoneProgressParams,
     };
 
-    async fn goto_at(ws: &Workspace, doc: &Document, line: u32, character: u32) -> Location {
+    fn goto_at(ws: &Workspace, doc: &Document, line: u32, character: u32) -> Location {
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
@@ -96,14 +91,14 @@ mod tests {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
-        match goto(ws, doc, &params).await {
+        match goto(ws, doc, &params) {
             Some(GotoDefinitionResponse::Scalar(loc)) => loc,
             other => panic!("expected a single location, got {other:?}"),
         }
     }
 
     /// `main.foobar` includes `inc.foobar`, which defines `name` on line 1.
-    async fn setup() -> (TempDir, Workspace, Document, Uri) {
+    fn setup() -> (TempDir, Workspace, Document, Uri) {
         let dir = TempDir::new().unwrap();
         let inc_path = dir.path().join("inc.foobar");
         fs::write(&inc_path, "defines\nname: \"timo\"\n").unwrap();
@@ -113,31 +108,31 @@ mod tests {
             "include inc.foobar\n\ndefines\ncmd: \"%(name)\"\n",
         );
         let ws = Workspace::default();
-        ws.refresh_includes_for(&doc).await;
+        ws.refresh_includes_for(&doc.snapshot);
         let inc_uri = path_to_uri(&inc_path.canonicalize().unwrap()).unwrap();
         (dir, ws, doc, inc_uri)
     }
 
-    #[tokio::test]
-    async fn goto_variable_via_include() {
-        let (_dir, ws, doc, inc_uri) = setup().await;
+    #[test]
+    fn goto_variable_via_include() {
+        let (_dir, ws, doc, inc_uri) = setup();
         // Inside `name` of `%(name)`.
-        let loc = goto_at(&ws, &doc, 3, 8).await;
+        let loc = goto_at(&ws, &doc, 3, 8);
         assert_eq!(loc.uri, inc_uri);
         assert_eq!(loc.range.start, Position::new(1, 0));
     }
 
-    #[tokio::test]
-    async fn goto_include_path() {
-        let (_dir, ws, doc, inc_uri) = setup().await;
+    #[test]
+    fn goto_include_path() {
+        let (_dir, ws, doc, inc_uri) = setup();
         // Inside `inc.foobar`.
-        let loc = goto_at(&ws, &doc, 0, 10).await;
+        let loc = goto_at(&ws, &doc, 0, 10);
         assert_eq!(loc.uri, inc_uri);
         assert_eq!(loc.range, Range::default());
     }
 
-    #[tokio::test]
-    async fn goto_template_param_and_use() {
+    #[test]
+    fn goto_template_param_and_use() {
         let uri = Uri::from_str("file:///x.foobar").unwrap();
         let text = "defines\n  src: 'outer'\ntemplate t(src)\n  cmd: \"%(src)\"\n\
                     process p\n  use t(src: 'x')\n";
@@ -145,14 +140,14 @@ mod tests {
         let ws = Workspace::default();
 
         // `%(src)` in the template body is the parameter, not the define of the same name.
-        let loc = goto_at(&ws, &doc, 3, 11).await;
+        let loc = goto_at(&ws, &doc, 3, 11);
         assert_eq!(
             loc.range,
             Range::new(Position::new(2, 11), Position::new(2, 14))
         );
 
         // `use t` jumps to the template name.
-        let loc = goto_at(&ws, &doc, 5, 6).await;
+        let loc = goto_at(&ws, &doc, 5, 6);
         assert_eq!(
             loc.range,
             Range::new(Position::new(2, 9), Position::new(2, 10))

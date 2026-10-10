@@ -2,6 +2,8 @@
 //!
 //! Pushed to the client after a debounced delay.
 
+use std::sync::Arc;
+
 use ropey::Rope;
 use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
@@ -9,18 +11,16 @@ use tower_lsp_server::ls_types::{
 };
 use tree_sitter::Tree;
 
-use crate::document::Document;
-use crate::symbol::SymbolIndex;
-use crate::text::{RopeExt, path_to_uri, uri_to_path};
-use crate::workspace::Workspace;
+use crate::text::RopeExt;
+use crate::workspace::{FileSnapshot, Workspace, uri_key};
 
-pub async fn compute(workspace: &Workspace, doc: &Document) -> Vec<Diagnostic> {
-    let mut out = Vec::new();
-    collect_parse_errors(&doc.tree, &doc.rope, &mut out);
-    collect_symbol_diags(workspace, &doc.uri, &doc.symbols, &mut out).await;
-    collect_cycles(workspace, doc, &mut out).await;
-    collect_includes_diags(workspace, doc, &mut out).await;
-    collect_unused_defines(workspace, doc, &mut out).await;
+/// All diagnostics for one file. Plain synchronous code: it reads snapshots, never locks.
+pub fn compute(workspace: &Workspace, file: &Arc<FileSnapshot>) -> Vec<Diagnostic> {
+    let mut out = file.parse_diags.clone();
+    collect_symbol_diags(workspace, file, &mut out);
+    collect_cycles(workspace, file, &mut out);
+    collect_includes_diags(workspace, file, &mut out);
+    collect_unused_defines(workspace, file, &mut out);
     out
 }
 
@@ -56,25 +56,23 @@ pub(crate) fn collect_parse_errors(tree: &Tree, rope: &Rope, out: &mut Vec<Diagn
 }
 
 /// Checks that need only a file's symbol index; shared with included files.
-async fn collect_symbol_diags(
+fn collect_symbol_diags(
     workspace: &Workspace,
-    base_uri: &Uri,
-    symbols: &SymbolIndex,
+    file: &Arc<FileSnapshot>,
     out: &mut Vec<Diagnostic>,
 ) {
-    collect_undefined_variables(workspace, base_uri, symbols, out).await;
-    collect_missing_includes(workspace, base_uri, symbols, out);
-    collect_template_uses(workspace, base_uri, symbols, out).await;
+    collect_undefined_variables(workspace, file, out);
+    collect_missing_includes(workspace, file, out);
+    collect_template_uses(workspace, file, out);
 }
 
-async fn collect_undefined_variables(
+fn collect_undefined_variables(
     workspace: &Workspace,
-    base_uri: &Uri,
-    symbols: &SymbolIndex,
+    file: &Arc<FileSnapshot>,
     out: &mut Vec<Diagnostic>,
 ) {
-    for (name, range) in &symbols.var_refs {
-        if !workspace.has_define(base_uri, symbols, name).await {
+    for (name, range) in &file.symbols.var_refs {
+        if !workspace.has_define(file, name) {
             out.push(make_diag(
                 *range,
                 DiagnosticSeverity::ERROR,
@@ -86,15 +84,13 @@ async fn collect_undefined_variables(
 }
 
 /// Every `use` must name a known template and pass exactly its parameters.
-async fn collect_template_uses(
+fn collect_template_uses(
     workspace: &Workspace,
-    base_uri: &Uri,
-    symbols: &SymbolIndex,
+    file: &Arc<FileSnapshot>,
     out: &mut Vec<Diagnostic>,
 ) {
-    for u in &symbols.uses {
-        let Some((_, template)) = workspace.lookup_template(base_uri, symbols, &u.name).await
-        else {
+    for u in &file.symbols.uses {
+        let Some((_, template)) = workspace.lookup_template(file, &u.name) else {
             out.push(make_diag(
                 u.name_range,
                 DiagnosticSeverity::ERROR,
@@ -126,14 +122,9 @@ async fn collect_template_uses(
     }
 }
 
-fn collect_missing_includes(
-    workspace: &Workspace,
-    base_uri: &Uri,
-    symbols: &SymbolIndex,
-    out: &mut Vec<Diagnostic>,
-) {
-    for inc in &symbols.includes {
-        match workspace.resolve(base_uri, &inc.raw_path) {
+fn collect_missing_includes(workspace: &Workspace, file: &FileSnapshot, out: &mut Vec<Diagnostic>) {
+    for inc in &file.symbols.includes {
+        match workspace.resolve(&file.uri, &inc.raw_path) {
             None => out.push(make_diag(
                 inc.path_range,
                 DiagnosticSeverity::ERROR,
@@ -151,18 +142,17 @@ fn collect_missing_includes(
     }
 }
 
-async fn collect_cycles(workspace: &Workspace, doc: &Document, out: &mut Vec<Diagnostic>) {
-    let Some(doc_path) = uri_to_path(&doc.uri).and_then(|p| p.canonicalize().ok()) else {
+fn collect_cycles(workspace: &Workspace, file: &FileSnapshot, out: &mut Vec<Diagnostic>) {
+    let Some(path) = uri_key(&file.uri) else {
         return;
     };
 
     // Walk each include separately so the diagnostic lands on the include that starts the cycle.
-    for root in &doc.symbols.includes {
+    for root in &file.symbols.includes {
         let cyclic = workspace
-            .reachable(&doc.uri, std::slice::from_ref(root))
-            .await
+            .reachable(&file.uri, std::slice::from_ref(root))
             .iter()
-            .any(|r| r.path == doc_path);
+            .any(|r| r.path == path);
         if cyclic {
             out.push(make_diag(
                 root.path_range,
@@ -177,46 +167,35 @@ async fn collect_cycles(workspace: &Workspace, doc: &Document, out: &mut Vec<Dia
     }
 }
 
-/// Walk doc's direct includes and surface each included file's diagnostics.
-async fn collect_includes_diags(workspace: &Workspace, doc: &Document, out: &mut Vec<Diagnostic>) {
-    let self_path = uri_to_path(&doc.uri).and_then(|p| p.canonicalize().ok());
+/// Walk the file's direct includes and surface each included file's diagnostics.
+fn collect_includes_diags(workspace: &Workspace, file: &FileSnapshot, out: &mut Vec<Diagnostic>) {
+    let self_path = uri_key(&file.uri);
 
-    for inc in &doc.symbols.includes {
-        let Some(resolved) = workspace.resolve(&doc.uri, &inc.raw_path) else {
+    for inc in &file.symbols.includes {
+        let Some(resolved) = workspace.resolve(&file.uri, &inc.raw_path) else {
             continue;
         };
-        if !resolved.exists || self_path.as_deref() == Some(resolved.path.as_path()) {
+        if !resolved.exists || self_path.as_ref() == Some(&resolved.path) {
             continue;
         }
-
-        let mut sub_diags: Vec<Diagnostic> = Vec::new();
-        let included_uri = if let Some(open) = workspace.doc_at(&resolved.path) {
-            let open = open.read().await;
-            collect_parse_errors(&open.tree, &open.rope, &mut sub_diags);
-            collect_symbol_diags(workspace, &open.uri, &open.symbols, &mut sub_diags).await;
-            open.uri.clone()
-        } else if let Some(file) = workspace.disk.get(&resolved.path).map(|f| f.clone())
-            && let Some(uri) = path_to_uri(&resolved.path)
-        {
-            sub_diags.extend(file.parse_diags.iter().cloned());
-            collect_symbol_diags(workspace, &uri, &file.symbols, &mut sub_diags).await;
-            uri
-        } else {
+        let Some(included) = workspace.file(&resolved.path) else {
             continue;
         };
 
+        let mut sub_diags = included.parse_diags.clone();
+        collect_symbol_diags(workspace, &included, &mut sub_diags);
         out.extend(
             sub_diags
                 .iter()
-                .map(|d| wrap_for_parent(&included_uri, &inc.raw_path, inc.path_range, d)),
+                .map(|d| wrap_for_parent(&included.uri, &inc.raw_path, inc.path_range, d)),
         );
     }
 }
 
 /// Warning for defines that are never referenced anywhere in the workspace.
-async fn collect_unused_defines(workspace: &Workspace, doc: &Document, out: &mut Vec<Diagnostic>) {
-    for (name, entry) in &doc.symbols.defines {
-        if workspace.count_refs(name).await == 0 {
+fn collect_unused_defines(workspace: &Workspace, file: &FileSnapshot, out: &mut Vec<Diagnostic>) {
+    for (name, entry) in &file.symbols.defines {
+        if workspace.count_refs(name) == 0 {
             out.push(Diagnostic {
                 // Editors render UNNECESSARY as grayed-out text.
                 tags: Some(vec![DiagnosticTag::UNNECESSARY]),
@@ -278,11 +257,11 @@ fn make_diag(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::Document;
+    use crate::text::path_to_uri;
     use std::fs;
     use std::str::FromStr;
-    use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::RwLock;
     use tower_lsp_server::ls_types::Position;
 
     fn with_code<'a>(diags: &'a [Diagnostic], code: &str) -> Vec<&'a Diagnostic> {
@@ -294,71 +273,65 @@ mod tests {
     }
 
     /// Writes `inc.foobar` and `main.foobar` into a temp dir and opens main.
-    async fn main_with_include(
-        ws: &Workspace,
-        inc_text: &str,
-        main_text: &str,
-    ) -> (TempDir, Document) {
+    fn main_with_include(ws: &Workspace, inc_text: &str, main_text: &str) -> (TempDir, Document) {
         let dir = TempDir::new().unwrap();
         let main_path = dir.path().join("main.foobar");
         fs::write(dir.path().join("inc.foobar"), inc_text).unwrap();
         fs::write(&main_path, main_text).unwrap();
         let doc = Document::from_text(path_to_uri(&main_path).unwrap(), main_text);
-        ws.refresh_includes_for(&doc).await;
+        ws.refresh_includes_for(&doc.snapshot);
         (dir, doc)
     }
 
-    #[tokio::test]
-    async fn missing_value_is_a_parse_error() {
+    #[test]
+    fn missing_value_is_a_parse_error() {
         let ws = Workspace::default();
         // tree-sitter recovers from `name:` by inserting a zero-width MISSING value node.
         let doc = Document::from_text(
             Uri::from_str("file:///x.foobar").unwrap(),
             "defines\nname:\n",
         );
-        let diags = compute(&ws, &doc).await;
+        let diags = compute(&ws, &doc.snapshot);
         let missing = with_code(&diags, "missing-token");
         assert_eq!(missing.len(), 1, "got: {diags:?}");
         assert_eq!(missing[0].range.start, Position::new(1, 5));
     }
 
-    #[tokio::test]
-    async fn undefined_variable() {
+    #[test]
+    fn undefined_variable() {
         let ws = Workspace::default();
         let text = "defines\nx: \"1\"\ncmd: \"%(x) %(unknown)\"\n";
         let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), text);
-        let diags = compute(&ws, &doc).await;
+        let diags = compute(&ws, &doc.snapshot);
         let undefined = with_code(&diags, "undefined-variable");
         assert_eq!(undefined.len(), 1, "got: {diags:?}");
         assert_eq!(undefined[0].message, "undefined variable: unknown");
     }
 
-    #[tokio::test]
-    async fn defined_via_include() {
+    #[test]
+    fn defined_via_include() {
         let ws = Workspace::default();
         let (_dir, doc) = main_with_include(
             &ws,
             "defines\nx: \"1\"\n",
             "include inc.foobar\n\ndefines\ncmd: \"%(x)\"\n",
-        )
-        .await;
-        let diags = compute(&ws, &doc).await;
+        );
+        let diags = compute(&ws, &doc.snapshot);
         assert!(
             with_code(&diags, "undefined-variable").is_empty(),
             "got: {diags:?}"
         );
     }
 
-    #[tokio::test]
-    async fn error_in_included_file_is_anchored_at_include() {
+    #[test]
+    fn error_in_included_file_is_anchored_at_include() {
         let ws = Workspace::default();
         let (_dir, doc) = main_with_include(
             &ws,
             "defines\nval: \"%(missing)\"\n",
             "# main\ninclude inc.foobar\n",
-        )
-        .await;
-        let diags = compute(&ws, &doc).await;
+        );
+        let diags = compute(&ws, &doc.snapshot);
         let surfaced = with_code(&diags, "included-error");
         assert_eq!(surfaced.len(), 1, "got: {diags:?}");
         assert_eq!(surfaced[0].range.start.line, 1);
@@ -367,16 +340,15 @@ mod tests {
         assert_eq!(related.location.range.start.line, 1);
     }
 
-    #[tokio::test]
-    async fn cyclic_include_is_reported_in_current_doc() {
+    #[test]
+    fn cyclic_include_is_reported_in_current_doc() {
         let ws = Workspace::default();
         let (_dir, doc) = main_with_include(
             &ws,
             "include main.foobar\n",
             "# comment\n# another comment\ninclude inc.foobar\n",
-        )
-        .await;
-        let diags = compute(&ws, &doc).await;
+        );
+        let diags = compute(&ws, &doc.snapshot);
         let cycles = with_code(&diags, "cyclic-include");
         assert_eq!(cycles.len(), 1, "got: {diags:?}");
         // The range of `inc.foobar` in main, not of `main.foobar` in inc.
@@ -386,18 +358,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn unused_define_is_tagged_unnecessary() {
+    #[test]
+    fn unused_define_is_tagged_unnecessary() {
         let ws = Workspace::default();
         let doc = Document::from_text(
             Uri::from_str("file:///x.foobar").unwrap(),
             "defines\nfoo: \"1\"\nbar: \"%(foo)\"\n",
         );
-        // count_refs only sees documents registered in the workspace (did_open does this).
-        let uri = doc.uri.clone();
-        let doc = Arc::new(RwLock::new(doc));
-        ws.docs.insert(uri, doc.clone());
-        let diags = compute(&ws, &*doc.read().await).await;
+        // count_refs only sees published files (did_open does this).
+        ws.publish(&doc);
+        let diags = compute(&ws, &doc.snapshot);
 
         let unused = with_code(&diags, "unused-define");
         assert_eq!(unused.len(), 1, "got: {diags:?}");
@@ -405,13 +375,13 @@ mod tests {
         assert_eq!(unused[0].tags, Some(vec![DiagnosticTag::UNNECESSARY]));
     }
 
-    #[tokio::test]
-    async fn template_uses_are_checked() {
+    #[test]
+    fn template_uses_are_checked() {
         let ws = Workspace::default();
         let text = "template t(a, b)\n  cmd: \"%(a) %(b)\"\n\n\
                     process p\n  use t(a: '1', c: '2')\n  use nope()\n";
         let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), text);
-        let diags = compute(&ws, &doc).await;
+        let diags = compute(&ws, &doc.snapshot);
 
         // `%(a)` and `%(b)` are parameters, not undefined variables.
         assert!(
@@ -432,8 +402,8 @@ mod tests {
     }
 
     /// A valid template example (the one shown in the talk) produces no diagnostics.
-    #[tokio::test]
-    async fn template_example_is_clean() {
+    #[test]
+    fn template_example_is_clean() {
         let text = r#"defines
   name: "eurorust"
   program_compile: "typst"
@@ -447,11 +417,9 @@ process compile presentation
 "#;
         let ws = Workspace::default();
         let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), text);
-        // count_refs only sees documents registered in the workspace (did_open does this).
-        let uri = doc.uri.clone();
-        let doc = Arc::new(RwLock::new(doc));
-        ws.docs.insert(uri, doc.clone());
-        let diags = compute(&ws, &*doc.read().await).await;
+        // count_refs only sees published files (did_open does this).
+        ws.publish(&doc);
+        let diags = compute(&ws, &doc.snapshot);
         assert!(diags.is_empty(), "got: {diags:?}");
     }
 }

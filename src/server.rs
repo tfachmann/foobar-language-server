@@ -22,13 +22,17 @@ use crate::diagnostics;
 use crate::document::Document;
 use crate::hover;
 use crate::text::uri_to_path;
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, uri_key};
 
 const DIAGNOSTICS_DEBOUNCE_MS: u64 = 250;
 
+/// Cheap to clone: every field is shared, so spawned tasks get their own handle.
+#[derive(Clone)]
 pub struct Backend {
     client: Client,
     workspace: Arc<Workspace>,
+    /// Edit state of open documents. Only the LSP handlers below ever lock these.
+    docs: Arc<DashMap<Uri, Arc<RwLock<Document>>>>,
     /// Pending diagnostics-publish tasks per URI. Aborted on subsequent edits.
     pending_diags: Arc<DashMap<Uri, JoinHandle<()>>>,
 }
@@ -38,58 +42,57 @@ impl Backend {
         Self {
             client,
             workspace: Arc::new(Workspace::default()),
+            docs: Arc::new(DashMap::new()),
             pending_diags: Arc::new(DashMap::new()),
         }
     }
 
-    /// Schedule diagnostics for `uri` and all open docs that include it.
-    fn schedule_diagnostics(&self, uri: Uri) {
-        self.schedule_one(uri.clone());
+    /// The open document for `uri`, cloned out of the map so no DashMap guard is held.
+    fn doc(&self, uri: &Uri) -> Option<Arc<RwLock<Document>>> {
+        self.docs.get(uri).map(|e| e.value().clone())
+    }
 
-        let Some(path) = uri_to_path(&uri).and_then(|p| p.canonicalize().ok()) else {
+    /// Schedule diagnostics for `uri` and all open docs that include it.
+    fn schedule_diagnostics(&self, uri: &Uri) {
+        self.schedule_one(uri.clone());
+        self.schedule_dependents(uri);
+    }
+
+    /// Schedule diagnostics for the open docs that include `uri`.
+    fn schedule_dependents(&self, uri: &Uri) {
+        let Some(path) = uri_key(uri) else {
             return;
         };
         for dep_uri in self.workspace.dependents_of(&path) {
-            if dep_uri != uri {
+            if &dep_uri != uri {
                 self.schedule_one(dep_uri);
             }
         }
     }
 
+    /// Cancel any pending diagnostics publish for `uri` and schedule a fresh one.
     fn schedule_one(&self, uri: Uri) {
-        schedule_one(
-            self.workspace.clone(),
-            self.client.clone(),
-            self.pending_diags.clone(),
-            uri,
-        );
-    }
-}
-
-/// Cancel any pending diagnostics publish for `uri` and schedule a fresh one.
-fn schedule_one(
-    workspace: Arc<Workspace>,
-    client: Client,
-    pending: Arc<DashMap<Uri, JoinHandle<()>>>,
-    uri: Uri,
-) {
-    if let Some((_, prev)) = pending.remove(&uri) {
-        prev.abort();
-    }
-    let key = uri.clone();
-    let pending_for_task = pending.clone();
-    let handle = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(DIAGNOSTICS_DEBOUNCE_MS)).await;
-        if let Some(doc) = workspace.doc(&uri) {
-            let doc = doc.read().await;
-            let diags = diagnostics::compute(&workspace, &doc).await;
-            client
-                .publish_diagnostics(uri.clone(), diags, Some(doc.version))
-                .await;
+        if let Some((_, prev)) = self.pending_diags.remove(&uri) {
+            prev.abort();
         }
-        pending_for_task.remove(&uri);
-    });
-    pending.insert(key, handle);
+        let this = self.clone();
+        let key = uri.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(DIAGNOSTICS_DEBOUNCE_MS)).await;
+            if let Some(doc) = this.doc(&uri) {
+                // Copy what we need and release the lock before computing or sending.
+                let (snapshot, version) = {
+                    let doc = doc.read().await;
+                    (doc.snapshot.clone(), doc.version)
+                };
+                let diags = diagnostics::compute(&this.workspace, &snapshot);
+                this.client
+                    .publish_diagnostics(uri.clone(), diags, Some(version))
+                    .await;
+            }
+        });
+        self.pending_diags.insert(key, handle);
+    }
 }
 
 impl LanguageServer for Backend {
@@ -118,19 +121,17 @@ impl LanguageServer for Backend {
             env!("CARGO_PKG_VERSION"),
         );
         self.client.log_message(MessageType::INFO, &banner).await;
-        let ws = self.workspace.clone();
-        let client = self.client.clone();
-        let pending = self.pending_diags.clone();
+        let this = self.clone();
         tokio::spawn(async move {
-            let scan_ws = ws.clone();
-            let _ = tokio::task::spawn_blocking(move || scan_ws.scan_workspace()).await;
-            client
+            let ws = this.workspace.clone();
+            let _ = tokio::task::spawn_blocking(move || ws.scan_workspace()).await;
+            this.client
                 .log_message(MessageType::INFO, "workspace scan complete")
                 .await;
             // Re-check open docs: the scan may resolve previously undefined variables.
-            let open_uris: Vec<Uri> = ws.docs.iter().map(|e| e.key().clone()).collect();
+            let open_uris: Vec<Uri> = this.docs.iter().map(|e| e.key().clone()).collect();
             for uri in open_uris {
-                schedule_one(ws.clone(), client.clone(), pending.clone(), uri);
+                this.schedule_one(uri);
             }
         });
     }
@@ -143,12 +144,10 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.clone();
         match Document::open(params) {
             Ok(doc) => {
-                let doc = Arc::new(RwLock::new(doc));
-                self.workspace.docs.insert(uri.clone(), doc.clone());
-                self.workspace
-                    .refresh_includes_for(&*doc.read().await)
-                    .await;
-                self.schedule_diagnostics(uri);
+                self.workspace.publish(&doc);
+                self.workspace.refresh_includes_for(&doc.snapshot);
+                self.docs.insert(uri.clone(), Arc::new(RwLock::new(doc)));
+                self.schedule_diagnostics(&uri);
             }
             Err(e) => {
                 self.client
@@ -160,7 +159,7 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        let Some(doc) = self.workspace.doc(&uri) else {
+        let Some(doc) = self.doc(&uri) else {
             self.client
                 .log_message(
                     MessageType::WARNING,
@@ -169,35 +168,50 @@ impl LanguageServer for Backend {
                 .await;
             return;
         };
-        if let Err(e) = doc.write().await.apply_change(params) {
-            self.client
-                .log_message(MessageType::ERROR, format!("did_change failed: {e:#}"))
-                .await;
-            return;
+        {
+            let mut doc = doc.write().await;
+            // A did_change that lost the race against did_close must not publish.
+            if doc.closed {
+                return;
+            }
+            if let Err(e) = doc.apply_change(params) {
+                drop(doc);
+                self.client
+                    .log_message(MessageType::ERROR, format!("did_change failed: {e:#}"))
+                    .await;
+                return;
+            }
+            // Publish under the write lock so snapshots land in edit order.
+            self.workspace.publish(&doc);
+            self.workspace.refresh_includes_for(&doc.snapshot);
         }
-        self.workspace
-            .refresh_includes_for(&*doc.read().await)
-            .await;
-        self.schedule_diagnostics(uri);
+        self.schedule_diagnostics(&uri);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
+        // Tasks scheduled from now on find no document and publish nothing.
+        if let Some((_, doc)) = self.docs.remove(&uri) {
+            let mut doc = doc.write().await;
+            doc.closed = true;
+            self.workspace.close(&doc);
+        }
         if let Some((_, prev)) = self.pending_diags.remove(&uri) {
             prev.abort();
+            let _ = prev.await;
         }
-        self.workspace.docs.remove(&uri);
-        self.workspace.forget_doc(&uri);
+        // The disk version may differ from the closed buffer.
+        self.schedule_dependents(&uri);
         // Clear any diagnostics currently shown for this doc on the client.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
-        let Some(doc) = self.workspace.doc(uri) else {
+        let Some(doc) = self.doc(uri) else {
             return Ok(None);
         };
-        Ok(hover::hover(&self.workspace, &*doc.read().await, &params).await)
+        Ok(hover::hover(&self.workspace, &*doc.read().await, &params))
     }
 
     async fn goto_definition(
@@ -205,10 +219,14 @@ impl LanguageServer for Backend {
         params: GotoDefinitionParams,
     ) -> RpcResult<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
-        let Some(doc) = self.workspace.doc(uri) else {
+        let Some(doc) = self.doc(uri) else {
             return Ok(None);
         };
-        Ok(definition::goto(&self.workspace, &*doc.read().await, &params).await)
+        Ok(definition::goto(
+            &self.workspace,
+            &*doc.read().await,
+            &params,
+        ))
     }
 }
 
