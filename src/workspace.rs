@@ -19,7 +19,7 @@ use tree_sitter::Parser;
 
 use crate::diagnostics::collect_parse_errors;
 use crate::document::Document;
-use crate::symbol::{DefineEntry, IncludeRef, SymbolIndex};
+use crate::symbol::{DefineEntry, IncludeRef, SymbolIndex, TemplateDef};
 use crate::text::{path_to_uri, uri_to_path};
 
 /// One file that the LSP knows about via the filesystem (not opened in the editor).
@@ -30,18 +30,11 @@ pub struct DiskFile {
     pub parse_diags: Vec<Diagnostic>,
 }
 
-/// Where a definition was found.
+/// Where a symbol was found.
 #[derive(Clone, Debug)]
-pub enum DefineSource {
+pub enum Source {
     OpenDoc(Uri),
     Disk(PathBuf),
-}
-
-/// A successful symbol resolution.
-#[derive(Clone, Debug)]
-pub struct DefineHit {
-    pub entry: DefineEntry,
-    pub source: DefineSource,
 }
 
 /// Outcome of resolving a raw include path.
@@ -57,7 +50,7 @@ pub struct ResolvedInclude {
 pub struct Reached {
     pub path: PathBuf,
     /// Snapshot of the file's symbols. `None` if the file is missing or unreadable.
-    pub file: Option<(DefineSource, SymbolIndex)>,
+    pub file: Option<(Source, SymbolIndex)>,
 }
 
 /// Open documents, disk-cached included files, and the include graph between them.
@@ -143,15 +136,15 @@ impl Workspace {
                     None
                 } else if let Some(doc) = self.doc_at(&resolved.path) {
                     let doc = doc.read().await;
-                    Some((DefineSource::OpenDoc(doc.uri.clone()), doc.symbols.clone()))
+                    Some((Source::OpenDoc(doc.uri.clone()), doc.symbols.clone()))
                 } else {
                     self.load_if_stale(&resolved.path)
-                        .map(|f| (DefineSource::Disk(resolved.path.clone()), f.symbols.clone()))
+                        .map(|f| (Source::Disk(resolved.path.clone()), f.symbols.clone()))
                 };
                 if let Some((source, symbols)) = &file {
                     let next_base = match source {
-                        DefineSource::OpenDoc(uri) => Some(uri.clone()),
-                        DefineSource::Disk(path) => path_to_uri(path),
+                        Source::OpenDoc(uri) => Some(uri.clone()),
+                        Source::Disk(path) => path_to_uri(path),
                     };
                     queue.push_back((next_base.unwrap_or(base.clone()), symbols.includes.clone()));
                 }
@@ -205,52 +198,75 @@ impl Workspace {
         Some(loaded)
     }
 
-    /// Find the define for `name`: the doc itself first, then its transitive includes.
-    pub async fn lookup_define(&self, doc: &Document, name: &str) -> Option<DefineHit> {
-        if let Some(entry) = doc.symbols.defines.get(name) {
-            return Some(DefineHit {
-                entry: entry.clone(),
-                source: DefineSource::OpenDoc(doc.uri.clone()),
-            });
+    /// Search `local` first, then everything it transitively includes.
+    ///
+    /// `pick` extracts the wanted symbol from one file's index.
+    pub async fn lookup<T>(
+        &self,
+        base: &Uri,
+        local: &SymbolIndex,
+        pick: impl Fn(&SymbolIndex) -> Option<T>,
+    ) -> Option<(Source, T)> {
+        if let Some(hit) = pick(local) {
+            return Some((Source::OpenDoc(base.clone()), hit));
         }
-        self.reachable(&doc.uri, &doc.symbols.includes)
+        self.reachable(base, &local.includes)
             .await
             .into_iter()
             .find_map(|r| {
                 let (source, symbols) = r.file?;
-                let entry = symbols.defines.get(name)?.clone();
-                Some(DefineHit { entry, source })
+                Some((source, pick(&symbols)?))
             })
     }
 
-    /// Does `name` resolve from the file at `base_uri` with symbols `local`?
-    ///
-    /// Checks the file itself, its transitive includes, and finally every file in the workspace.
-    pub async fn has_define(&self, base_uri: &Uri, local: &SymbolIndex, name: &str) -> bool {
-        if local.defines.contains_key(name) {
-            return true;
-        }
-        let via_include = self
-            .reachable(base_uri, &local.includes)
-            .await
-            .iter()
-            .filter_map(|r| r.file.as_ref())
-            .any(|(_, symbols)| symbols.defines.contains_key(name));
-        if via_include {
-            return true;
-        }
-
-        // Workspace-wide pool fallback.
+    /// Search every open and disk-cached file, whether it is included or not.
+    pub async fn lookup_anywhere<T>(
+        &self,
+        pick: impl Fn(&SymbolIndex) -> Option<T>,
+    ) -> Option<(Source, T)> {
         let doc_arcs: Vec<Arc<RwLock<Document>>> =
             self.docs.iter().map(|e| e.value().clone()).collect();
         for doc_arc in doc_arcs {
-            if doc_arc.read().await.symbols.defines.contains_key(name) {
-                return true;
+            let doc = doc_arc.read().await;
+            if let Some(hit) = pick(&doc.symbols) {
+                return Some((Source::OpenDoc(doc.uri.clone()), hit));
             }
         }
-        self.disk
-            .iter()
-            .any(|e| e.value().symbols.defines.contains_key(name))
+        self.disk.iter().find_map(|e| {
+            let hit = pick(&e.value().symbols)?;
+            Some((Source::Disk(e.key().clone()), hit))
+        })
+    }
+
+    /// The define for `name`, from the file itself or its transitive includes.
+    pub async fn lookup_define(
+        &self,
+        base: &Uri,
+        local: &SymbolIndex,
+        name: &str,
+    ) -> Option<(Source, DefineEntry)> {
+        self.lookup(base, local, |s| s.defines.get(name).cloned())
+            .await
+    }
+
+    /// Does `name` resolve via [`Self::lookup_define`] or anywhere else in the workspace?
+    pub async fn has_define(&self, base: &Uri, local: &SymbolIndex, name: &str) -> bool {
+        let pick = |s: &SymbolIndex| s.defines.get(name).map(|_| ());
+        self.lookup(base, local, pick).await.is_some() || self.lookup_anywhere(pick).await.is_some()
+    }
+
+    /// The template `name`, from the file itself, its includes, or anywhere in the workspace.
+    pub async fn lookup_template(
+        &self,
+        base: &Uri,
+        local: &SymbolIndex,
+        name: &str,
+    ) -> Option<(Source, TemplateDef)> {
+        let pick = |s: &SymbolIndex| s.templates.get(name).cloned();
+        match self.lookup(base, local, pick).await {
+            Some(hit) => Some(hit),
+            None => self.lookup_anywhere(pick).await,
+        }
     }
 
     /// Workspace-wide count of `%(name)` references.
@@ -376,9 +392,12 @@ mod tests {
 
         let main_doc =
             Document::from_text(path_to_uri(&main_path).unwrap(), "include inc.foobar\n");
-        let hit = ws.lookup_define(&main_doc, "name").await.unwrap();
-        assert_eq!(hit.entry.value_text, "buffer");
-        assert!(matches!(hit.source, DefineSource::OpenDoc(_)));
+        let (source, entry) = ws
+            .lookup_define(&main_doc.uri, &main_doc.symbols, "name")
+            .await
+            .unwrap();
+        assert_eq!(entry.value_text, "buffer");
+        assert!(matches!(source, Source::OpenDoc(_)));
     }
 
     #[tokio::test]

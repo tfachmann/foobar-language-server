@@ -12,6 +12,14 @@ pub fn keyword_doc(name: &str) -> Option<&'static str> {
             "**process** `<name>` - opens a named process section.\n\n\
              Followed by entries that configure the process (e.g. `command:`).",
         ),
+        "template" => Some(
+            "**template** `<name>(<params>)` - defines reusable process entries.\n\n\
+             Parameters are referenced as `%(param)` inside the template body.",
+        ),
+        "use" => Some(
+            "**use** `<template>(<param>: <value>, ...)` - inserts a template's entries into a process.\n\n\
+             Every template parameter must be passed.",
+        ),
         "include" => Some(
             "**include** `<path>` - pulls another foobar file into the symbol scope.\n\n\
              Path is relative to the including file's directory.",

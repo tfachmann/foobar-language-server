@@ -21,6 +21,21 @@ pub struct ProcessHeader {
 }
 
 #[derive(Clone, Debug)]
+pub struct TemplateDef {
+    pub name_range: Range,
+    pub params: Vec<String>,
+}
+
+/// A `use name(arg: "...", ...)` call inside a process.
+#[derive(Clone, Debug)]
+pub struct UseRef {
+    pub name: String,
+    pub name_range: Range,
+    /// Argument names with their ranges.
+    pub args: Vec<(String, Range)>,
+}
+
+#[derive(Clone, Debug)]
 pub struct IncludeRef {
     /// Raw path text as written in source, trimmed of surrounding whitespace.
     pub raw_path: String,
@@ -32,8 +47,10 @@ pub struct IncludeRef {
 pub struct SymbolIndex {
     pub defines: HashMap<String, DefineEntry>,
     pub processes: Vec<ProcessHeader>,
+    pub templates: HashMap<String, TemplateDef>,
+    pub uses: Vec<UseRef>,
     pub includes: Vec<IncludeRef>,
-    /// Every `%(name)` reference encountered.
+    /// Every `%(name)` reference to a define (template parameters excluded).
     pub var_refs: Vec<(String, Range)>,
 }
 
@@ -44,13 +61,19 @@ impl SymbolIndex {
 
         let mut defines: HashMap<String, DefineEntry> = HashMap::new();
         let mut processes: Vec<ProcessHeader> = Vec::new();
+        let mut templates: HashMap<String, TemplateDef> = HashMap::new();
+        let mut uses: Vec<UseRef> = Vec::new();
         let mut includes: Vec<IncludeRef> = Vec::new();
 
         let mut cursor = root.walk();
         for section in root.children(&mut cursor) {
             match section.kind() {
                 "section_defines" => defines.extend(collect_defines(section, rope)),
-                "section_process" => processes.push(collect_process(section, rope)),
+                "section_process" => {
+                    processes.push(collect_process(section, rope));
+                    uses.extend(children(section, "use").map(|u| collect_use(u, rope)));
+                }
+                "section_template" => templates.extend(collect_template(section, rope)),
                 "include" => {
                     if let Some(r) = collect_include(section, rope) {
                         includes.push(r);
@@ -63,6 +86,8 @@ impl SymbolIndex {
         Self {
             defines,
             processes,
+            templates,
+            uses,
             includes,
             var_refs: collect_refs(root, rope),
         }
@@ -95,7 +120,7 @@ fn collect_defines(section: Node, rope: &Rope) -> Vec<(String, DefineEntry)> {
         .collect()
 }
 
-/// Collects the name and entry count of a `process` section.
+/// Collects the name and entry count (`use` lines included) of a `process` section.
 fn collect_process(section: Node, rope: &Rope) -> ProcessHeader {
     let mut cursor = section.walk();
     let children: Vec<Node> = section.children(&mut cursor).collect();
@@ -105,7 +130,41 @@ fn collect_process(section: Node, rope: &Rope) -> ProcessHeader {
             .find(|c| c.kind() == "name")
             .map(|n| rope.node_text(*n).trim().to_string())
             .unwrap_or_default(),
-        entry_count: children.iter().filter(|c| c.kind() == "entry").count(),
+        entry_count: children
+            .iter()
+            .filter(|c| matches!(c.kind(), "entry" | "use"))
+            .count(),
+    }
+}
+
+/// Collects the name and parameter list of a `template` section.
+fn collect_template(section: Node, rope: &Rope) -> Option<(String, TemplateDef)> {
+    let name = children(section, "identifier").next()?;
+    let params = children(section, "parameters")
+        .flat_map(|p| children(p, "identifier"))
+        .map(|p| rope.node_text(p))
+        .collect();
+    Some((
+        rope.node_text(name),
+        TemplateDef {
+            name_range: rope.node_range(name),
+            params,
+        },
+    ))
+}
+
+/// Collects the template name and argument names of a `use` call.
+fn collect_use(node: Node, rope: &Rope) -> UseRef {
+    let name = children(node, "identifier").next();
+    let args = children(node, "arguments")
+        .flat_map(|a| children(a, "argument"))
+        .filter_map(|a| children(a, "identifier").next())
+        .map(|id| (rope.node_text(id), rope.node_range(id)))
+        .collect();
+    UseRef {
+        name: name.map(|n| rope.node_text(n)).unwrap_or_default(),
+        name_range: rope.node_range(name.unwrap_or(node)),
+        args,
     }
 }
 
@@ -120,7 +179,7 @@ fn collect_include(section: Node, rope: &Rope) -> Option<IncludeRef> {
     })
 }
 
-/// Collects every `%(name)` use anywhere in the tree.
+/// Collects every `%(name)` use anywhere in the tree, except uses of template parameters.
 fn collect_refs(root: Node, rope: &Rope) -> Vec<(String, Range)> {
     let mut out: Vec<(String, Range)> = Vec::new();
     let mut stack = vec![root];
@@ -130,6 +189,7 @@ fn collect_refs(root: Node, rope: &Rope) -> Vec<(String, Range)> {
             if let Some(id) = node
                 .children(&mut walker)
                 .find(|c| c.kind() == "identifier")
+                && template_param(id, rope).is_none()
             {
                 out.push((rope.node_text(id), rope.node_range(id)));
             }
@@ -140,6 +200,25 @@ fn collect_refs(root: Node, rope: &Rope) -> Vec<(String, Range)> {
         }
     }
     out
+}
+
+/// The template parameter that the identifier of a `%(name)` refers to, if any.
+///
+/// Inside a template body, `%(name)` means the parameter when the template declares `name`.
+pub fn template_param<'a>(ident: Node<'a>, rope: &Rope) -> Option<Node<'a>> {
+    let template = std::iter::successors(ident.parent(), |n| n.parent())
+        .find(|n| n.kind() == "section_template")?;
+    let name = rope.node_text(ident);
+    children(template, "parameters")
+        .flat_map(|p| children(p, "identifier"))
+        .find(|p| rope.node_text(*p) == name)
+}
+
+/// Direct children of `node` with the given kind.
+fn children<'a>(node: Node<'a>, kind: &'static str) -> impl Iterator<Item = Node<'a>> {
+    let mut cursor = node.walk();
+    let all: Vec<Node<'a>> = node.children(&mut cursor).collect();
+    all.into_iter().filter(move |c| c.kind() == kind)
 }
 
 fn strip_quotes(s: &str) -> String {

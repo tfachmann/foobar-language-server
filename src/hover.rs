@@ -1,7 +1,8 @@
 //! Hover dispatch on the node under the cursor:
-//! - keyword tokens (`defines`, `process`, `include`)
-//! - variable uses `%(name)` and define keys
+//! - keyword tokens (`defines`, `process`, `template`, `use`, `include`)
+//! - variable uses `%(name)` (define or template parameter) and define keys
 //! - process headers and process entry keys
+//! - template names and `use` calls
 //! - include paths
 
 use tower_lsp_server::ls_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
@@ -9,8 +10,9 @@ use tree_sitter::Node;
 
 use crate::document::Document;
 use crate::keywords::{keyword_doc, process_entry_key_doc};
+use crate::symbol::{TemplateDef, template_param};
 use crate::text::RopeExt;
-use crate::workspace::{DefineSource, Workspace};
+use crate::workspace::{Source, Workspace};
 
 pub async fn hover(workspace: &Workspace, doc: &Document, params: &HoverParams) -> Option<Hover> {
     let pos = params.text_document_position_params.position;
@@ -26,11 +28,11 @@ pub async fn hover(workspace: &Workspace, doc: &Document, params: &HoverParams) 
 }
 
 async fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<String> {
-    // Case 1: keyword tokens (defines / process / include). Anonymous, parent is the section node.
+    // Case 1: keyword tokens. Anonymous, parent is the section node.
     if let Some(parent) = node.parent()
         && matches!(
             parent.kind(),
-            "section_defines" | "section_process" | "include"
+            "section_defines" | "section_process" | "section_template" | "use" | "include"
         )
         && !node.is_named()
         && let Some(doc_md) = keyword_doc(&doc.rope.node_text(node))
@@ -47,6 +49,9 @@ async fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option
         // Case 3: identifier inside a variable use, e.g. %(file_name).
         ("identifier", Some("variable")) => {
             let name = doc.rope.node_text(node);
+            if template_param(node, &doc.rope).is_some() {
+                return Some(format!("**{name}** - template parameter"));
+            }
             hover_variable_use(workspace, doc, &name).await
         }
         // Case 4 / 5: identifier as an entry key.
@@ -68,31 +73,59 @@ async fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option
             let name = doc.rope.node_text(node).trim().to_string();
             hover_process_header(doc, &name)
         }
+        // Case 7: template name in its definition.
+        ("identifier", Some("section_template")) => {
+            let name = doc.rope.node_text(node);
+            let template = doc.symbols.templates.get(&name)?;
+            Some(format!("**template** `{}`", signature(&name, template)))
+        }
+        // Case 8: template name in a `use` call.
+        ("identifier", Some("use")) => {
+            let name = doc.rope.node_text(node);
+            let (source, template) = workspace
+                .lookup_template(&doc.uri, &doc.symbols, &name)
+                .await?;
+            Some(format!(
+                "**template** `{}`\n---\n{}",
+                signature(&name, &template),
+                location(doc, &source, template.name_range.start.line + 1),
+            ))
+        }
         _ => None,
     }
 }
 
 async fn hover_variable_use(workspace: &Workspace, doc: &Document, name: &str) -> Option<String> {
-    let hit = workspace.lookup_define(doc, name).await?;
-    let line = hit.entry.key_range.start.line + 1;
-    let location = match &hit.source {
-        DefineSource::OpenDoc(uri) if uri == &doc.uri => format!("defined at line {line}"),
-        DefineSource::OpenDoc(uri) => {
+    let (source, entry) = workspace
+        .lookup_define(&doc.uri, &doc.symbols, name)
+        .await?;
+    Some(format!(
+        "**{name}** = `{value}`\n---\n{location}",
+        value = entry.value_text,
+        location = location(doc, &source, entry.key_range.start.line + 1),
+    ))
+}
+
+/// "defined at line N [in `file`]" for a symbol found at `source`.
+fn location(doc: &Document, source: &Source, line: u32) -> String {
+    match source {
+        Source::OpenDoc(uri) if uri == &doc.uri => format!("defined at line {line}"),
+        Source::OpenDoc(uri) => {
             let file = uri.as_str().rsplit('/').next().unwrap_or(uri.as_str());
             format!("defined at line {line} in `{file}` (open)")
         }
-        DefineSource::Disk(path) => {
+        Source::Disk(path) => {
             let file = path
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("<unknown>");
             format!("defined at line {line} in `{file}`")
         }
-    };
-    Some(format!(
-        "**{name}** = `{value}`\n---\n{location}",
-        value = hit.entry.value_text,
-    ))
+    }
+}
+
+fn signature(name: &str, template: &TemplateDef) -> String {
+    format!("{name}({})", template.params.join(", "))
 }
 
 async fn hover_defines_key(workspace: &Workspace, doc: &Document, name: &str) -> Option<String> {

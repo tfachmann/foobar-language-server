@@ -17,8 +17,7 @@ use crate::workspace::Workspace;
 pub async fn compute(workspace: &Workspace, doc: &Document) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     collect_parse_errors(&doc.tree, &doc.rope, &mut out);
-    collect_undefined_variables(workspace, &doc.uri, &doc.symbols, &mut out).await;
-    collect_missing_includes(workspace, &doc.uri, &doc.symbols, &mut out);
+    collect_symbol_diags(workspace, &doc.uri, &doc.symbols, &mut out).await;
     collect_cycles(workspace, doc, &mut out).await;
     collect_includes_diags(workspace, doc, &mut out).await;
     collect_unused_defines(workspace, doc, &mut out).await;
@@ -56,6 +55,18 @@ pub(crate) fn collect_parse_errors(tree: &Tree, rope: &Rope, out: &mut Vec<Diagn
     }
 }
 
+/// Checks that need only a file's symbol index; shared with included files.
+async fn collect_symbol_diags(
+    workspace: &Workspace,
+    base_uri: &Uri,
+    symbols: &SymbolIndex,
+    out: &mut Vec<Diagnostic>,
+) {
+    collect_undefined_variables(workspace, base_uri, symbols, out).await;
+    collect_missing_includes(workspace, base_uri, symbols, out);
+    collect_template_uses(workspace, base_uri, symbols, out).await;
+}
+
 async fn collect_undefined_variables(
     workspace: &Workspace,
     base_uri: &Uri,
@@ -70,6 +81,47 @@ async fn collect_undefined_variables(
                 "undefined-variable",
                 format!("undefined variable: {name}"),
             ));
+        }
+    }
+}
+
+/// Every `use` must name a known template and pass exactly its parameters.
+async fn collect_template_uses(
+    workspace: &Workspace,
+    base_uri: &Uri,
+    symbols: &SymbolIndex,
+    out: &mut Vec<Diagnostic>,
+) {
+    for u in &symbols.uses {
+        let Some((_, template)) = workspace.lookup_template(base_uri, symbols, &u.name).await
+        else {
+            out.push(make_diag(
+                u.name_range,
+                DiagnosticSeverity::ERROR,
+                "unknown-template",
+                format!("unknown template: {}", u.name),
+            ));
+            continue;
+        };
+        for (arg, range) in &u.args {
+            if !template.params.contains(arg) {
+                out.push(make_diag(
+                    *range,
+                    DiagnosticSeverity::ERROR,
+                    "unknown-argument",
+                    format!("template `{}` has no parameter `{arg}`", u.name),
+                ));
+            }
+        }
+        for param in &template.params {
+            if !u.args.iter().any(|(arg, _)| arg == param) {
+                out.push(make_diag(
+                    u.name_range,
+                    DiagnosticSeverity::ERROR,
+                    "missing-argument",
+                    format!("missing argument `{param}` for template `{}`", u.name),
+                ));
+            }
         }
     }
 }
@@ -141,15 +193,13 @@ async fn collect_includes_diags(workspace: &Workspace, doc: &Document, out: &mut
         let included_uri = if let Some(open) = workspace.doc_at(&resolved.path) {
             let open = open.read().await;
             collect_parse_errors(&open.tree, &open.rope, &mut sub_diags);
-            collect_undefined_variables(workspace, &open.uri, &open.symbols, &mut sub_diags).await;
-            collect_missing_includes(workspace, &open.uri, &open.symbols, &mut sub_diags);
+            collect_symbol_diags(workspace, &open.uri, &open.symbols, &mut sub_diags).await;
             open.uri.clone()
         } else if let Some(file) = workspace.disk.get(&resolved.path).map(|f| f.clone())
             && let Some(uri) = path_to_uri(&resolved.path)
         {
             sub_diags.extend(file.parse_diags.iter().cloned());
-            collect_undefined_variables(workspace, &uri, &file.symbols, &mut sub_diags).await;
-            collect_missing_includes(workspace, &uri, &file.symbols, &mut sub_diags);
+            collect_symbol_diags(workspace, &uri, &file.symbols, &mut sub_diags).await;
             uri
         } else {
             continue;
@@ -353,5 +403,55 @@ mod tests {
         assert_eq!(unused.len(), 1, "got: {diags:?}");
         assert_eq!(unused[0].message, "`bar` is defined but never referenced");
         assert_eq!(unused[0].tags, Some(vec![DiagnosticTag::UNNECESSARY]));
+    }
+
+    #[tokio::test]
+    async fn template_uses_are_checked() {
+        let ws = Workspace::default();
+        let text = "template t(a, b)\n  cmd: \"%(a) %(b)\"\n\n\
+                    process p\n  use t(a: '1', c: '2')\n  use nope()\n";
+        let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), text);
+        let diags = compute(&ws, &doc).await;
+
+        // `%(a)` and `%(b)` are parameters, not undefined variables.
+        assert!(
+            with_code(&diags, "undefined-variable").is_empty(),
+            "got: {diags:?}"
+        );
+        let unknown_arg = with_code(&diags, "unknown-argument");
+        assert_eq!(unknown_arg.len(), 1, "got: {diags:?}");
+        assert_eq!(unknown_arg[0].message, "template `t` has no parameter `c`");
+        let missing = with_code(&diags, "missing-argument");
+        assert_eq!(missing.len(), 1, "got: {diags:?}");
+        assert_eq!(missing[0].message, "missing argument `b` for template `t`");
+        assert_eq!(
+            with_code(&diags, "unknown-template").len(),
+            1,
+            "got: {diags:?}"
+        );
+    }
+
+    /// A valid template example (the one shown in the talk) produces no diagnostics.
+    #[tokio::test]
+    async fn template_example_is_clean() {
+        let text = r#"defines
+  name: "eurorust"
+  program_compile: "typst"
+
+template compile(src, dst)
+  command: "%(program_compile) compile %(src) %(dst)"
+
+process compile presentation
+  use compile(src: "%(name).typ", dst: "%(name).pdf")
+  cwd: 'slides'
+"#;
+        let ws = Workspace::default();
+        let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), text);
+        // count_refs only sees documents registered in the workspace (did_open does this).
+        let uri = doc.uri.clone();
+        let doc = Arc::new(RwLock::new(doc));
+        ws.docs.insert(uri, doc.clone());
+        let diags = compute(&ws, &*doc.read().await).await;
+        assert!(diags.is_empty(), "got: {diags:?}");
     }
 }

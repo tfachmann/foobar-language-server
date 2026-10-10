@@ -1,14 +1,16 @@
 //! Goto-definition dispatch.
 //!
-//! Two jump cases mirror hover:
-//! - `%(name)` -> the matching `name:` define (local or via transitive includes).
+//! Jump cases mirror hover:
+//! - `%(name)` -> the template parameter `name`, else the matching `name:` define.
+//! - `use name(...)` -> the template definition.
 //! - `include some_other.foobar` -> the included file's start.
 
 use tower_lsp_server::ls_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Range};
 
 use crate::document::Document;
+use crate::symbol::template_param;
 use crate::text::{RopeExt, path_to_uri};
-use crate::workspace::{DefineSource, Workspace};
+use crate::workspace::{Source, Workspace};
 
 pub async fn goto(
     workspace: &Workspace,
@@ -18,16 +20,35 @@ pub async fn goto(
     let pos = params.text_document_position_params.position;
     let node = doc.node_at(pos)?;
 
-    // Variable reference: %(name) -> matching `name:` define.
-    if node.kind() == "identifier" && node.parent().is_some_and(|p| p.kind() == "variable") {
+    let parent_kind = node.parent().map(|p| p.kind());
+
+    // Variable reference: %(name) -> template parameter, else matching `name:` define.
+    if node.kind() == "identifier" && parent_kind == Some("variable") {
+        if let Some(param) = template_param(node, &doc.rope) {
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri: doc.uri.clone(),
+                range: doc.rope.node_range(param),
+            }));
+        }
         let name = doc.rope.node_text(node);
-        let hit = workspace.lookup_define(doc, &name).await?;
-        return source_to_location(&hit.source, hit.entry.key_range)
+        let (source, entry) = workspace
+            .lookup_define(&doc.uri, &doc.symbols, &name)
+            .await?;
+        return source_to_location(&source, entry.key_range).map(GotoDefinitionResponse::Scalar);
+    }
+
+    // Template call: `use name(...)` -> template definition.
+    if node.kind() == "identifier" && parent_kind == Some("use") {
+        let name = doc.rope.node_text(node);
+        let (source, template) = workspace
+            .lookup_template(&doc.uri, &doc.symbols, &name)
+            .await?;
+        return source_to_location(&source, template.name_range)
             .map(GotoDefinitionResponse::Scalar);
     }
 
     // Include path: `include some_other.foobar` -> file start.
-    if node.kind() == "path" && node.parent().is_some_and(|p| p.kind() == "include") {
+    if node.kind() == "path" && parent_kind == Some("include") {
         let raw = doc.rope.node_text(node).trim().to_string();
         let resolved = workspace.resolve(&doc.uri, &raw)?;
         if !resolved.exists {
@@ -43,13 +64,13 @@ pub async fn goto(
     None
 }
 
-fn source_to_location(source: &DefineSource, range: Range) -> Option<Location> {
+fn source_to_location(source: &Source, range: Range) -> Option<Location> {
     match source {
-        DefineSource::OpenDoc(uri) => Some(Location {
+        Source::OpenDoc(uri) => Some(Location {
             uri: uri.clone(),
             range,
         }),
-        DefineSource::Disk(path) => path_to_uri(path).map(|uri| Location { uri, range }),
+        Source::Disk(path) => path_to_uri(path).map(|uri| Location { uri, range }),
     }
 }
 
@@ -57,6 +78,7 @@ fn source_to_location(source: &DefineSource, range: Range) -> Option<Location> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::str::FromStr;
     use tempfile::TempDir;
     use tower_lsp_server::ls_types::{
         PartialResultParams, Position, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
@@ -112,5 +134,28 @@ mod tests {
         let loc = goto_at(&ws, &doc, 0, 10).await;
         assert_eq!(loc.uri, inc_uri);
         assert_eq!(loc.range, Range::default());
+    }
+
+    #[tokio::test]
+    async fn goto_template_param_and_use() {
+        let uri = Uri::from_str("file:///x.foobar").unwrap();
+        let text = "defines\n  src: 'outer'\ntemplate t(src)\n  cmd: \"%(src)\"\n\
+                    process p\n  use t(src: 'x')\n";
+        let doc = Document::from_text(uri, text);
+        let ws = Workspace::default();
+
+        // `%(src)` in the template body is the parameter, not the define of the same name.
+        let loc = goto_at(&ws, &doc, 3, 11).await;
+        assert_eq!(
+            loc.range,
+            Range::new(Position::new(2, 11), Position::new(2, 14))
+        );
+
+        // `use t` jumps to the template name.
+        let loc = goto_at(&ws, &doc, 5, 6).await;
+        assert_eq!(
+            loc.range,
+            Range::new(Position::new(2, 9), Position::new(2, 10))
+        );
     }
 }
