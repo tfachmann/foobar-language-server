@@ -118,7 +118,7 @@ impl Workspace {
     }
 
     /// All snapshots, cloned out of the map so callers can load files while iterating.
-    fn all_files(&self) -> Vec<Arc<FileSnapshot>> {
+    pub fn all_files(&self) -> Vec<Arc<FileSnapshot>> {
         self.files.iter().map(|e| e.value().clone()).collect()
     }
 

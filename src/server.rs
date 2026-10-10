@@ -13,9 +13,9 @@ use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf, Position, Range,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
-    Uri,
+    InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf, Position,
+    Range, ReferenceParams, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Uri,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing_subscriber::EnvFilter;
@@ -26,6 +26,7 @@ use crate::diagnostics;
 use crate::document::Document;
 use crate::format::Formatter;
 use crate::hover;
+use crate::references;
 use crate::text::{RopeExt, uri_to_path};
 use crate::workspace::{Workspace, uri_key};
 
@@ -159,6 +160,7 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 // `(` of `%(` and `use t(`, `,` between arguments; `use ` completes when
                 // invoked or while typing the name.
                 completion_provider: Some(CompletionOptions {
@@ -303,6 +305,18 @@ impl LanguageServer for Backend {
                 Ok(None)
             }
         }
+    }
+
+    async fn references(&self, params: ReferenceParams) -> RpcResult<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let Some(doc) = self.doc(uri) else {
+            return Ok(None);
+        };
+        Ok(references::references(
+            &self.workspace,
+            &*doc.read().await,
+            &params,
+        ))
     }
 
     async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {
