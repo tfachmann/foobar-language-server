@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -24,7 +24,7 @@ use crate::completion;
 use crate::definition;
 use crate::diagnostics;
 use crate::document::Document;
-use crate::format;
+use crate::format::Formatter;
 use crate::hover;
 use crate::text::{RopeExt, uri_to_path};
 use crate::workspace::{Workspace, uri_key};
@@ -58,6 +58,17 @@ pub struct Backend {
     docs: Arc<DashMap<Uri, Arc<RwLock<Document>>>>,
     /// Pending diagnostics-publish tasks per URI. Aborted on subsequent edits.
     pending_diags: Arc<DashMap<Uri, JoinHandle<()>>>,
+    /// Set once from `initializationOptions` in `initialize`.
+    format_options: Arc<OnceLock<FormatOptions>>,
+}
+
+/// Formatting settings from `initializationOptions`.
+#[derive(Clone, Default)]
+struct FormatOptions {
+    /// `formattingQuery`: a Topiary query file, relative to the first workspace root.
+    query: Option<PathBuf>,
+    /// `formattingIndent`: the indentation string.
+    indent: Option<String>,
 }
 
 impl Backend {
@@ -67,6 +78,7 @@ impl Backend {
             workspace: Arc::new(Workspace::default()),
             docs: Arc::new(DashMap::new()),
             pending_diags: Arc::new(DashMap::new()),
+            format_options: Arc::new(OnceLock::new()),
         }
     }
 
@@ -125,7 +137,20 @@ impl Backend {
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
-        self.workspace.set_roots(collect_roots(&params));
+        let roots = collect_roots(&params);
+        let options = params.initialization_options.as_ref();
+        let option = |key: &str| {
+            let value = options.and_then(|o| o.get(key))?;
+            value.as_str().map(str::to_string)
+        };
+        let _ = self.format_options.set(FormatOptions {
+            query: option("formattingQuery").map(|query| match roots.first() {
+                Some(root) => root.join(query),
+                None => PathBuf::from(query),
+            }),
+            indent: option("formattingIndent"),
+        });
+        self.workspace.set_roots(roots);
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -249,7 +274,7 @@ impl LanguageServer for Backend {
         Ok(hover::hover(&self.workspace, &*doc.read().await, &params))
     }
 
-    /// One edit replacing the whole buffer; nothing on syntax errors.
+    /// One edit replacing the whole buffer. Nothing on syntax errors.
     async fn formatting(
         &self,
         params: DocumentFormattingParams,
@@ -257,19 +282,27 @@ impl LanguageServer for Backend {
         let Some(doc) = self.doc(&params.text_document.uri) else {
             return Ok(None);
         };
-        let doc = doc.read().await;
-        let text = doc.rope.to_string();
-        let Ok(formatted) = format::format(&text) else {
-            return Ok(None);
+        let (text, end) = {
+            let doc = doc.read().await;
+            let end = doc.rope.byte_to_lsp_position(doc.rope.len_bytes());
+            (doc.rope.to_string(), end)
         };
-        if formatted == text {
-            return Ok(Some(Vec::new()));
+        let options = self.format_options.get().cloned().unwrap_or_default();
+        // Loaded per request, so edits to a custom query apply without a restart.
+        let formatted = Formatter::load(options.query.as_deref(), options.indent.as_deref())
+            .and_then(|formatter| formatter.format(&text));
+        match formatted {
+            Ok(Some(formatted)) if formatted != text => Ok(Some(vec![TextEdit::new(
+                Range::new(Position::new(0, 0), end),
+                formatted,
+            )])),
+            Ok(_) => Ok(None),
+            Err(e) => {
+                let message = format!("foobar: formatting failed: {e:#}");
+                self.client.show_message(MessageType::ERROR, message).await;
+                Ok(None)
+            }
         }
-        let end = doc.rope.byte_to_lsp_position(doc.rope.len_bytes());
-        Ok(Some(vec![TextEdit::new(
-            Range::new(Position::new(0, 0), end),
-            formatted,
-        )]))
     }
 
     async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {

@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use foobar_language_server::cli::{self, MessageFormat};
+use foobar_language_server::format::Formatter;
 use foobar_language_server::server;
 
 /// Language tooling for the foobar config DSL.
@@ -42,6 +43,12 @@ enum Command {
         /// Files or directories to format.
         #[arg(default_value = ".")]
         paths: Vec<PathBuf>,
+        /// Topiary query file to use instead of the built-in rules.
+        #[arg(long)]
+        query: Option<PathBuf>,
+        /// Indentation string [default: two spaces].
+        #[arg(long)]
+        indent: Option<String>,
     },
 }
 
@@ -53,7 +60,13 @@ fn main() -> ExitCode {
             root,
             message_format,
         } => cli::lint(&root, &paths, message_format),
-        Command::Fmt { check, paths } => cli::fmt(&paths, check),
+        Command::Fmt {
+            check,
+            paths,
+            query,
+            indent,
+        } => Formatter::load(query.as_deref(), indent.as_deref())
+            .and_then(|formatter| cli::fmt(&paths, check, &formatter)),
     };
     result.unwrap_or_else(|e| {
         eprintln!("error: {e:#}");

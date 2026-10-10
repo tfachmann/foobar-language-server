@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 
 use crate::diagnostics;
-use crate::format;
+use crate::format::Formatter;
 use crate::text::{RopeExt, TextPos};
 use crate::workspace::{Workspace, file_key, walk_foobar_files};
 
@@ -225,7 +225,7 @@ fn to_json(reports: &[FileReport]) -> Value {
 /// Format `paths` in place, skipping files with syntax errors.
 ///
 /// `check` writes nothing and lists the files that would change (exit code 1).
-pub fn fmt(paths: &[PathBuf], check: bool) -> Result<ExitCode> {
+pub fn fmt(paths: &[PathBuf], check: bool, formatter: &Formatter) -> Result<ExitCode> {
     let (dirs, files): (Vec<_>, Vec<_>) = paths.iter().cloned().partition(|p| p.is_dir());
 
     let mut files: Vec<PathBuf> = files.into_iter().chain(walk_foobar_files(&dirs)).collect();
@@ -235,8 +235,13 @@ pub fn fmt(paths: &[PathBuf], check: bool) -> Result<ExitCode> {
     for path in files {
         let text =
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let formatted = match format::format(&text) {
-            Ok(formatted) => formatted,
+        let formatted = match formatter.format(&text) {
+            Ok(Some(formatted)) => formatted,
+            Ok(None) => {
+                eprintln!("{}: syntax errors, not formatted", shown(&path).display());
+                failed = true;
+                continue;
+            }
             Err(e) => {
                 eprintln!("{}: {e:#}, not formatted", shown(&path).display());
                 failed = true;
