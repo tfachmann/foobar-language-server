@@ -82,11 +82,11 @@ impl Document {
     }
 
     /// Smallest tree-sitter node at the LSP cursor position.
+    ///
+    /// Looks up by byte: tree-sitter rows only count `\n`, LSP lines also break at `\r`.
     pub fn node_at(&self, pos: Position) -> Option<Node<'_>> {
-        let point = self.rope.lsp_position_to_text_pos(pos).point;
-        self.tree
-            .root_node()
-            .descendant_for_point_range(point, point)
+        let byte = self.rope.lsp_position_to_text_pos(pos).byte;
+        self.tree.root_node().descendant_for_byte_range(byte, byte)
     }
 
     #[cfg(test)]
@@ -162,5 +162,23 @@ mod tests {
         change(&mut doc, None, "defines\nb: \"2\"\n");
         assert!(doc.symbols.defines.contains_key("b"));
         assert!(!doc.symbols.defines.contains_key("a"));
+    }
+
+    /// Lines break at `\n`, `\r\n` and `\r` only (as in LSP), and positions clamp to the line end.
+    #[test]
+    fn positions_follow_lsp_lines() {
+        // U+2028 is not a line break for LSP; the lone `\r` is.
+        let text = "# a\u{2028}b\ndefines\rx: \"%(y)\"\n";
+        let doc = Document::from_text(uri(), text);
+        let node = doc.node_at(Position::new(2, 6)).unwrap();
+        assert_eq!(doc.rope.node_text(node), "y");
+
+        let byte = |line, character| {
+            doc.rope
+                .lsp_position_to_text_pos(Position::new(line, character))
+                .byte
+        };
+        assert_eq!(byte(1, 99), text.find('\r').unwrap());
+        assert_eq!(byte(99, 0), text.len());
     }
 }

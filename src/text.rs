@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
-use ropey::Rope;
+use ropey::{Rope, RopeSlice};
 use tower_lsp_server::ls_types::{Position, Range, TextDocumentContentChangeEvent, Uri};
 use tree_sitter::{InputEdit, Node, Point};
 
@@ -72,11 +72,13 @@ pub trait RopeExt {
 
 impl RopeExt for Rope {
     fn lsp_position_to_text_pos(&self, pos: Position) -> TextPos {
-        let row = pos.line as usize;
+        // Out-of-range positions clamp to the last line and to the line end (LSP spec).
+        let row = (pos.line as usize).min(self.len_lines() - 1);
+        let line = self.line(row);
+        let line_end_utf16 = line.char_to_utf16_cu(line.len_chars() - line_break_len(line));
+        let col_utf16 = (pos.character as usize).min(line_end_utf16);
 
-        // ropey's UTF-16 index is document-wide, so offset the column by the line start.
-        let line_utf16 = self.char_to_utf16_cu(self.line_to_char(row));
-        let char = self.utf16_cu_to_char(line_utf16 + pos.character as usize);
+        let char = self.line_to_char(row) + line.utf16_cu_to_char(col_utf16);
         let byte = self.char_to_byte(char);
 
         TextPos {
@@ -153,6 +155,17 @@ impl RopeExt for Rope {
 
     fn node_range(&self, node: Node) -> Range {
         self.byte_range_to_lsp_range(node.start_byte(), node.end_byte())
+    }
+}
+
+/// Number of chars in the line break that ends `line` (`\n`, `\r\n` or `\r`).
+fn line_break_len(line: RopeSlice) -> usize {
+    let n = line.len_chars();
+    let last = |k: usize| n.checked_sub(k).map(|i| line.char(i));
+    match (last(2), last(1)) {
+        (Some('\r'), Some('\n')) => 2,
+        (_, Some('\n' | '\r')) => 1,
+        _ => 0,
     }
 }
 
