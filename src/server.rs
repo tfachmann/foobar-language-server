@@ -127,9 +127,10 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
-                // `(` of `%(`; `use ` completes when invoked or while typing the name.
+                // `(` of `%(` and `use t(`, `,` between arguments; `use ` completes when
+                // invoked or while typing the name.
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec!["(".to_string()]),
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
                     ..CompletionOptions::default()
                 }),
                 ..ServerCapabilities::default()

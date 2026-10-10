@@ -1,4 +1,5 @@
-//! Completion: defines and template parameters after `%(`, template names after `use`.
+//! Completion: defines and template parameters after `%(`, template names after `use`, and
+//! argument names inside `use name(...)`.
 
 use std::collections::HashSet;
 
@@ -7,7 +8,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::document::Document;
-use crate::text::RopeExt;
+use crate::text::{RopeExt, TextPos};
 use crate::workspace::Workspace;
 
 /// What is being typed at the cursor.
@@ -16,6 +17,11 @@ enum Context {
     Variable,
     /// A template name after `use`.
     Template,
+    /// An argument name inside `use template(...)`; `given` are the arguments already passed.
+    Argument {
+        template: String,
+        given: Vec<String>,
+    },
 }
 
 pub fn complete(
@@ -32,7 +38,7 @@ pub fn complete(
     let cursor = doc.rope.lsp_position_to_text_pos(pos);
     let line_start = doc.rope.line_to_char(cursor.point.row);
     let before = doc.rope.slice(line_start..cursor.char).to_string();
-    let context = context(&before)?;
+    let context = context(&before).or_else(|| argument_context(&call_before(doc, cursor)?))?;
 
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut seen = HashSet::new();
@@ -82,6 +88,21 @@ pub fn complete(
                 }
             }
         }
+        Context::Argument { template, given } => {
+            let (_, def) = workspace.lookup_template(&doc.snapshot, &template)?;
+            let missing = def.params.iter().filter(|p| !given.contains(p));
+            for (i, param) in missing.enumerate() {
+                items.push(CompletionItem {
+                    label: param.clone(),
+                    kind: Some(CompletionItemKind::PROPERTY),
+                    detail: Some(def.signature(&template)),
+                    // Declaration order; accepting inserts the colon too.
+                    sort_text: Some(format!("{i:04}")),
+                    insert_text: Some(format!("{param}: ")),
+                    ..CompletionItem::default()
+                });
+            }
+        }
     }
     Some(CompletionResponse::Array(items))
 }
@@ -95,6 +116,54 @@ fn context(before: &str) -> Option<Context> {
     }
     let rest = typed.trim_start().strip_prefix("use")?;
     (!rest.is_empty() && rest.trim().is_empty()).then_some(Context::Template)
+}
+
+/// Text from the start of the `use` line up to the cursor: a call may span lines.
+fn call_before(doc: &Document, cursor: TextPos) -> Option<String> {
+    let start = (0..=cursor.point.row).rev().find_map(|row| {
+        match doc.rope.line(row).to_string().split_whitespace().next() {
+            Some("use") => Some(Some(row)),
+            Some("defines" | "process" | "template" | "include") => Some(None),
+            _ => None,
+        }
+    })??;
+    Some(
+        doc.rope
+            .slice(doc.rope.line_to_char(start)..cursor.char)
+            .to_string(),
+    )
+}
+
+/// `use name(arg: "...", ` + partial argument name, from a [`call_before`] text.
+fn argument_context(call: &str) -> Option<Context> {
+    let (template, args) = call.trim_start().strip_prefix("use")?.split_once('(')?;
+    let mut given = Vec::new();
+    // The current argument's text outside quotes; values may contain `,` and `)`.
+    let mut current = String::new();
+    let mut quote = None;
+    for c in args.chars() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, ')') => return None,
+            (None, ',') => {
+                given.extend(current.split(':').next().map(|n| n.trim().to_string()));
+                current.clear();
+            }
+            (None, _) => current.push(c),
+        }
+    }
+    // Only a partial name so far: no `:`, not inside a value.
+    let partial = current.trim_start();
+    (quote.is_none()
+        && partial
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then(|| Context::Argument {
+        template: template.trim().to_string(),
+        given,
+    })
 }
 
 #[cfg(test)]
@@ -143,6 +212,21 @@ mod tests {
         );
         // Raw strings don't interpolate.
         assert_eq!(labels(items_at(text, 4, 10)), None);
+    }
+
+    /// Arguments already passed (even with `,` in a value, even on an earlier line) are skipped.
+    #[test]
+    fn arguments_inside_use_call() {
+        let template = "template add_note(name, kind)\n  note: \"%(kind): %(name)\"\n\nprocess p\n";
+        let first = format!("{template}  use add_note(\n");
+        assert_eq!(
+            labels(items_at(&first, 4, 15)),
+            Some(vec!["name".to_string(), "kind".to_string()])
+        );
+        let later = format!("{template}  use add_note(kind: 'x, y',\n    \n");
+        let items = items_at(&later, 5, 4).unwrap();
+        assert_eq!(labels(Some(items.clone())), Some(vec!["name".to_string()]));
+        assert_eq!(items[0].insert_text.as_deref(), Some("name: "));
     }
 
     #[test]
