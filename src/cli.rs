@@ -228,14 +228,20 @@ fn to_json(reports: &[FileReport]) -> Value {
 pub fn fmt(paths: &[PathBuf], check: bool) -> Result<ExitCode> {
     let (dirs, files): (Vec<_>, Vec<_>) = paths.iter().cloned().partition(|p| p.is_dir());
 
+    let mut files: Vec<PathBuf> = files.into_iter().chain(walk_foobar_files(&dirs)).collect();
+    files.sort();
+
     let mut failed = false;
-    for path in files.into_iter().chain(walk_foobar_files(&dirs)) {
+    for path in files {
         let text =
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let Some(formatted) = format::format(&text) else {
-            eprintln!("{}: syntax errors, not formatted", shown(&path).display());
-            failed = true;
-            continue;
+        let formatted = match format::format(&text) {
+            Ok(formatted) => formatted,
+            Err(e) => {
+                eprintln!("{}: {e:#}, not formatted", shown(&path).display());
+                failed = true;
+                continue;
+            }
         };
         if formatted == text {
             continue;

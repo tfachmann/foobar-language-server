@@ -11,10 +11,11 @@ use tokio::task::JoinHandle;
 use tower_lsp_server::jsonrpc::Result as RpcResult;
 use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, MessageType, OneOf, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf, Position, Range,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
+    Uri,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing_subscriber::EnvFilter;
@@ -23,8 +24,9 @@ use crate::completion;
 use crate::definition;
 use crate::diagnostics;
 use crate::document::Document;
+use crate::format;
 use crate::hover;
-use crate::text::uri_to_path;
+use crate::text::{RopeExt, uri_to_path};
 use crate::workspace::{Workspace, uri_key};
 
 const DIAGNOSTICS_DEBOUNCE_MS: u64 = 250;
@@ -131,6 +133,7 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 // `(` of `%(` and `use t(`, `,` between arguments; `use ` completes when
                 // invoked or while typing the name.
                 completion_provider: Some(CompletionOptions {
@@ -244,6 +247,29 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         Ok(hover::hover(&self.workspace, &*doc.read().await, &params))
+    }
+
+    /// One edit replacing the whole buffer; nothing on syntax errors.
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> RpcResult<Option<Vec<TextEdit>>> {
+        let Some(doc) = self.doc(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let doc = doc.read().await;
+        let text = doc.rope.to_string();
+        let Ok(formatted) = format::format(&text) else {
+            return Ok(None);
+        };
+        if formatted == text {
+            return Ok(Some(Vec::new()));
+        }
+        let end = doc.rope.byte_to_lsp_position(doc.rope.len_bytes());
+        Ok(Some(vec![TextEdit::new(
+            Range::new(Position::new(0, 0), end),
+            formatted,
+        )]))
     }
 
     async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {

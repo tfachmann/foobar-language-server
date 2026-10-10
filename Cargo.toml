@@ -19,8 +19,14 @@ tokio = { version = "1", features = [
 ] }
 tree-sitter = "0.26"
 tree-sitter-foobar = { path = "../tree-sitter-foobar" }
+# Formats with `tree_sitter_foobar::FORMATTING_QUERY`; pins tree-sitter to an exact version.
+topiary-core = "0.8"
+topiary-tree-sitter-facade = "0.8"
 # Default `unicode_lines` also breaks lines at U+2028 etc., which LSP does not.
-ropey = { version = "1.6", default-features = false, features = ["cr_lines", "simd"] }
+ropey = { version = "1.6", default-features = false, features = [
+  "cr_lines",
+  "simd",
+] }
 dashmap = "6"
 serde_json = "1"
 tracing = "0.1"
