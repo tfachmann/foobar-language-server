@@ -14,12 +14,11 @@ use tree_sitter::Tree;
 use crate::text::RopeExt;
 use crate::workspace::{FileSnapshot, Workspace, uri_key};
 
-/// All diagnostics for one file. Plain synchronous code: it reads snapshots, never locks.
+/// The file's own diagnostics: what `foobar lint` reports for each file.
 pub fn compute(workspace: &Workspace, file: &Arc<FileSnapshot>) -> Vec<Diagnostic> {
     let mut out = file.parse_diags.clone();
     collect_symbol_diags(workspace, file, &mut out);
     collect_cycles(workspace, file, &mut out);
-    collect_includes_diags(workspace, file, &mut out);
     collect_unused_defines(workspace, file, &mut out);
     out
 }
@@ -167,8 +166,9 @@ fn collect_cycles(workspace: &Workspace, file: &FileSnapshot, out: &mut Vec<Diag
     }
 }
 
-/// Walk the file's direct includes and surface each included file's diagnostics.
-fn collect_includes_diags(workspace: &Workspace, file: &FileSnapshot, out: &mut Vec<Diagnostic>) {
+/// Errors inside the file's direct includes, anchored at each `include` line.
+pub fn surface_includes(workspace: &Workspace, file: &FileSnapshot) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
     let self_path = uri_key(&file.uri);
 
     for inc in &file.symbols.includes {
@@ -190,6 +190,7 @@ fn collect_includes_diags(workspace: &Workspace, file: &FileSnapshot, out: &mut 
                 .map(|d| wrap_for_parent(&included.uri, &inc.raw_path, inc.path_range, d)),
         );
     }
+    out
 }
 
 /// Warning for defines that are never referenced anywhere in the workspace.
@@ -331,7 +332,7 @@ mod tests {
             "defines\nval: \"%(missing)\"\n",
             "# main\ninclude inc.foobar\n",
         );
-        let diags = compute(&ws, &doc.snapshot);
+        let diags = surface_includes(&ws, &doc.snapshot);
         let surfaced = with_code(&diags, "included-error");
         assert_eq!(surfaced.len(), 1, "got: {diags:?}");
         assert_eq!(surfaced[0].range.start.line, 1);

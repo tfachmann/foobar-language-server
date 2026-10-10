@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 
+[[bin]]
+name = "foobar"
+path = "src/main.rs"
+
 [dependencies]
 tower-lsp-server = "0.23"
 tokio = { version = "1", features = [
@@ -21,6 +25,7 @@ dashmap = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

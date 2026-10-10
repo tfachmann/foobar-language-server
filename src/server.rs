@@ -15,7 +15,8 @@ use tower_lsp_server::ls_types::{
     InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf, ServerCapabilities,
     ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
-use tower_lsp_server::{Client, LanguageServer};
+use tower_lsp_server::{Client, LanguageServer, LspService, Server};
+use tracing_subscriber::EnvFilter;
 
 use crate::definition;
 use crate::diagnostics;
@@ -25,6 +26,24 @@ use crate::text::uri_to_path;
 use crate::workspace::{Workspace, uri_key};
 
 const DIAGNOSTICS_DEBOUNCE_MS: u64 = 250;
+
+/// `foobar lsp`: serve the language server over stdin/stdout.
+pub fn run() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    tokio::runtime::Runtime::new()?.block_on(async {
+        let (service, socket) = LspService::new(Backend::new);
+        Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
+            .serve(service)
+            .await;
+    });
+    Ok(())
+}
 
 /// Cheap to clone: every field is shared, so spawned tasks get their own handle.
 #[derive(Clone)]
@@ -85,7 +104,8 @@ impl Backend {
                     let doc = doc.read().await;
                     (doc.snapshot.clone(), doc.version)
                 };
-                let diags = diagnostics::compute(&this.workspace, &snapshot);
+                let mut diags = diagnostics::compute(&this.workspace, &snapshot);
+                diags.extend(diagnostics::surface_includes(&this.workspace, &snapshot));
                 this.client
                     .publish_diagnostics(uri.clone(), diags, Some(version))
                     .await;

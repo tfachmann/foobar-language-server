@@ -10,6 +10,7 @@ use tower_lsp_server::ls_types::{
 };
 use tree_sitter::{Node, Parser, Tree};
 
+use crate::syntax;
 use crate::text::RopeExt;
 use crate::workspace::{FileSnapshot, Origin, uri_key};
 
@@ -38,11 +39,7 @@ pub struct Document {
 impl Document {
     pub fn open(params: DidOpenTextDocumentParams) -> Result<Self> {
         let item = params.text_document;
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_foobar::LANGUAGE.into())
-            .context("loading foobar grammar")?;
-
+        let mut parser = syntax::parser();
         let rope = Rope::from_str(&item.text);
         let tree = parser
             .parse(&item.text, None)

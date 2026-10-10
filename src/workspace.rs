@@ -13,11 +13,12 @@ use std::time::SystemTime;
 use dashmap::DashMap;
 use ropey::Rope;
 use tower_lsp_server::ls_types::{Diagnostic, Uri};
-use tree_sitter::{Parser, Tree};
+use tree_sitter::Tree;
 
 use crate::diagnostics::collect_parse_errors;
 use crate::document::Document;
 use crate::symbol::{DefineEntry, IncludeRef, SymbolIndex, TemplateDef};
+use crate::syntax;
 use crate::text::{path_to_uri, uri_to_path};
 
 /// What other files may know about a file. Replaced as a whole after every parse.
@@ -161,7 +162,7 @@ impl Workspace {
     }
 
     /// The snapshot for `path`, (re)read from disk unless it is open or the cached copy is current.
-    fn load(&self, path: &Path) -> Option<Arc<FileSnapshot>> {
+    pub fn load(&self, path: &Path) -> Option<Arc<FileSnapshot>> {
         let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
         if let Some(cached) = self.file(path)
             && (cached.origin == Origin::Open || cached.origin == Origin::Disk { mtime })
@@ -330,21 +331,16 @@ impl Workspace {
 /// Read + parse + index a file from disk. `None` on any IO/parse failure.
 fn load_disk_file(path: &Path, mtime: Option<SystemTime>) -> Option<FileSnapshot> {
     let text = fs::read_to_string(path).ok()?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_foobar::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(&text, None)?;
     Some(FileSnapshot::new(
         path_to_uri(path)?,
         Origin::Disk { mtime },
-        &tree,
+        &syntax::parse(&text),
         &Rope::from_str(&text),
     ))
 }
 
 /// Iterative DFS over `roots`, returning every `*.foobar` file found.
-fn walk_foobar_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+pub fn walk_foobar_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     const SKIP_DIRS: &[&str] = &["node_modules", "target"];
 
     let mut out: Vec<PathBuf> = Vec::new();
