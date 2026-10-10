@@ -10,14 +10,16 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_lsp_server::jsonrpc::Result as RpcResult;
 use tower_lsp_server::ls_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf, ServerCapabilities,
-    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
+    InitializeResult, InitializedParams, MessageType, OneOf, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing_subscriber::EnvFilter;
 
+use crate::completion;
 use crate::definition;
 use crate::diagnostics;
 use crate::document::Document;
@@ -125,6 +127,11 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                // `(` of `%(`; `use ` completes when invoked or while typing the name.
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec!["(".to_string()]),
+                    ..CompletionOptions::default()
+                }),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -232,6 +239,18 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         Ok(hover::hover(&self.workspace, &*doc.read().await, &params))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let Some(doc) = self.doc(uri) else {
+            return Ok(None);
+        };
+        Ok(completion::complete(
+            &self.workspace,
+            &*doc.read().await,
+            &params,
+        ))
     }
 
     async fn goto_definition(

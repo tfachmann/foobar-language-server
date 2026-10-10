@@ -26,6 +26,13 @@ pub struct TemplateDef {
     pub params: Vec<String>,
 }
 
+impl TemplateDef {
+    /// `name(param, ...)`, as shown by hover and completion.
+    pub fn signature(&self, name: &str) -> String {
+        format!("{name}({})", self.params.join(", "))
+    }
+}
+
 /// A `use name(arg: "...", ...)` call inside a process.
 #[derive(Clone, Debug)]
 pub struct UseRef {

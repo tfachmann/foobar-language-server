@@ -10,7 +10,7 @@ use tree_sitter::Node;
 
 use crate::document::Document;
 use crate::keywords::{keyword_doc, process_entry_key_doc};
-use crate::symbol::{TemplateDef, template_param};
+use crate::symbol::template_param;
 use crate::text::{RopeExt, uri_to_path};
 use crate::workspace::{FileSnapshot, Origin, Workspace};
 
@@ -77,7 +77,7 @@ fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<Strin
         ("identifier", Some("section_template")) => {
             let name = doc.rope.node_text(node);
             let template = doc.snapshot.symbols.templates.get(&name)?;
-            Some(format!("**template** `{}`", signature(&name, template)))
+            Some(format!("**template** `{}`", template.signature(&name)))
         }
         // Case 8: template name in a `use` call.
         ("identifier", Some("use")) => {
@@ -85,7 +85,7 @@ fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<Strin
             let (file, template) = workspace.lookup_template(&doc.snapshot, &name)?;
             Some(format!(
                 "**template** `{}`\n---\n{}",
-                signature(&name, &template),
+                template.signature(&name),
                 location(doc, &file, template.name_range.start.line + 1),
             ))
         }
@@ -116,10 +116,6 @@ fn location(doc: &Document, file: &FileSnapshot, line: u32) -> String {
         ""
     };
     format!("defined at line {line} in `{name}`{open}")
-}
-
-fn signature(name: &str, template: &TemplateDef) -> String {
-    format!("{name}({})", template.params.join(", "))
 }
 
 fn hover_defines_key(workspace: &Workspace, doc: &Document, name: &str) -> Option<String> {

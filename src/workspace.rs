@@ -276,6 +276,18 @@ impl Workspace {
             })
     }
 
+    /// Every file whose symbols `from` can use, nearest first: itself, its includes, the pool.
+    pub fn visible(&self, from: &Arc<FileSnapshot>) -> Vec<Arc<FileSnapshot>> {
+        let includes = self
+            .reachable(&from.uri, &from.symbols.includes)
+            .into_iter()
+            .filter_map(|r| r.file);
+        std::iter::once(from.clone())
+            .chain(includes)
+            .chain(self.all_files())
+            .collect()
+    }
+
     /// Search every known file, whether it is included or not.
     pub fn lookup_anywhere<T>(
         &self,
