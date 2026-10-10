@@ -77,7 +77,11 @@ fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<Strin
         ("identifier", Some("section_template")) => {
             let name = doc.rope.node_text(node);
             let template = doc.snapshot.symbols.templates.get(&name)?;
-            Some(format!("**template** `{}`", template.signature(&name)))
+            Some(format!(
+                "**template** `{}`\n---\n{}",
+                template.signature(&name),
+                usage(workspace.count_uses(&name)),
+            ))
         }
         // Case 8: template name in a `use` call.
         ("identifier", Some("use")) => {
@@ -120,16 +124,20 @@ fn location(doc: &Document, file: &FileSnapshot, line: u32) -> String {
 
 fn hover_defines_key(workspace: &Workspace, doc: &Document, name: &str) -> Option<String> {
     let entry = doc.snapshot.symbols.defines.get(name)?;
-    let n = workspace.count_refs(name);
-    let usage = match n {
-        0 => "_unused_".to_string(),
-        1 => "_used 1 time_".to_string(),
-        _ => format!("_used {n} times_"),
-    };
     Some(format!(
         "**{name}** = `{value}`  \n---\n{usage}",
         value = entry.value_text,
+        usage = usage(workspace.count_refs(name)),
     ))
+}
+
+/// `_unused_`, `_used 1 time_`, `_used N times_`.
+fn usage(n: usize) -> String {
+    match n {
+        0 => "_unused_".to_string(),
+        1 => "_used 1 time_".to_string(),
+        _ => format!("_used {n} times_"),
+    }
 }
 
 fn hover_process_header(doc: &Document, name: &str) -> Option<String> {

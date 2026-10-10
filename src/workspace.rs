@@ -334,6 +334,15 @@ impl Workspace {
             .count()
     }
 
+    /// Workspace-wide count of `use name(...)` calls.
+    pub fn count_uses(&self, name: &str) -> usize {
+        self.all_files()
+            .iter()
+            .flat_map(|f| &f.symbols.uses)
+            .filter(|u| u.name == name)
+            .count()
+    }
+
     /// Number of defines in a known file. `None` if the file isn't loaded.
     pub fn defines_count_at(&self, path: &Path) -> Option<usize> {
         self.file(path).map(|f| f.symbols.defines.len())
