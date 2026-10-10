@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use foobar_language_server::{cli, server};
+use foobar_language_server::cli::{self, MessageFormat};
+use foobar_language_server::server;
 
 /// Language tooling for the foobar config DSL.
 #[derive(Parser)]
@@ -29,6 +30,9 @@ enum Command {
         /// Workspace scanned for context: lookups and reference counts see every file in it.
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = MessageFormat::Human)]
+        message_format: MessageFormat,
     },
     /// Format files in place.
     Fmt {
@@ -44,7 +48,11 @@ enum Command {
 fn main() -> ExitCode {
     let result = match Args::parse().command {
         Command::Lsp { stdio: _ } => server::run().map(|()| ExitCode::SUCCESS),
-        Command::Lint { paths, root } => cli::lint(&root, &paths),
+        Command::Lint {
+            paths,
+            root,
+            message_format,
+        } => cli::lint(&root, &paths, message_format),
         Command::Fmt { check, paths } => cli::fmt(&paths, check),
     };
     result.unwrap_or_else(|e| {

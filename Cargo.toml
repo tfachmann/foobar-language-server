@@ -22,9 +22,11 @@ tree-sitter-foobar = { path = "../tree-sitter-foobar" }
 # Default `unicode_lines` also breaks lines at U+2028 etc., which LSP does not.
 ropey = { version = "1.6", default-features = false, features = ["cr_lines", "simd"] }
 dashmap = "6"
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+ariadne = "0.6"
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]

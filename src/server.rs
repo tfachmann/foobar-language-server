@@ -253,9 +253,9 @@ impl LanguageServer for Backend {
 /// Extract workspace roots from `InitializeParams`.
 ///
 /// Prefers `workspace_folders`, falls back to deprecated `root_uri`, then `root_path`.
-#[allow(deprecated)]
 fn collect_roots(params: &InitializeParams) -> Vec<PathBuf> {
     let folders = params.workspace_folders.iter().flatten().map(|f| &f.uri);
+    #[allow(deprecated)]
     let candidates = folders
         .chain(&params.root_uri)
         .filter_map(uri_to_path)
