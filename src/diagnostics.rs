@@ -21,6 +21,7 @@ pub fn compute(workspace: &Workspace, file: &Arc<FileSnapshot>) -> Vec<Diagnosti
     collect_symbol_diags(workspace, file, &mut out);
     collect_cycles(workspace, file, &mut out);
     collect_unused_defines(workspace, file, &mut out);
+    collect_unused_params(file, &mut out);
     collect_shadowed_builtins(file, &mut out);
     out
 }
@@ -242,6 +243,23 @@ fn collect_unused_defines(workspace: &Workspace, file: &FileSnapshot, out: &mut 
     }
 }
 
+/// Warning for template parameters the template body never uses.
+fn collect_unused_params(file: &FileSnapshot, out: &mut Vec<Diagnostic>) {
+    for (template, def) in &file.symbols.templates {
+        for (param, range) in &def.unused_params {
+            out.push(Diagnostic {
+                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                ..make_diag(
+                    *range,
+                    DiagnosticSeverity::WARNING,
+                    "unused-parameter",
+                    format!("parameter `{param}` of template `{template}` is never used"),
+                )
+            });
+        }
+    }
+}
+
 fn wrap_for_parent(
     included_uri: &Uri,
     raw_path: &str,
@@ -394,6 +412,17 @@ mod tests {
             cycles[0].range,
             Range::new(Position::new(2, 8), Position::new(2, 18))
         );
+    }
+
+    #[test]
+    fn unused_template_parameter() {
+        let ws = Workspace::default();
+        let text = "template t(a, b)\n  command: \"%(a)\"\n";
+        let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), text);
+        let diags = compute(&ws, &doc.snapshot);
+        let unused = with_code(&diags, "unused-parameter");
+        assert_eq!(unused.len(), 1, "got: {diags:?}");
+        assert_eq!(unused[0].range.start, Position::new(0, 14));
     }
 
     #[test]

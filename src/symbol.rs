@@ -1,6 +1,6 @@
 //! Per-document symbol index. Rebuilt after each successful parse.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ropey::Rope;
 use tower_lsp_server::ls_types::Range;
@@ -25,6 +25,7 @@ pub struct ProcessHeader {
 pub struct TemplateDef {
     pub name_range: Range,
     pub params: Vec<String>,
+    pub unused_params: Vec<(String, Range)>,
 }
 
 impl TemplateDef {
@@ -164,17 +165,39 @@ fn collect_process(section: Node, rope: &Rope) -> ProcessHeader {
 /// Collects the name and parameter list of a `template` section.
 fn collect_template(section: Node, rope: &Rope) -> Option<(String, TemplateDef)> {
     let name = children(section, kind::IDENTIFIER).next()?;
-    let params = children(section, kind::PARAMETERS)
+    let params: Vec<Node> = children(section, kind::PARAMETERS)
         .flat_map(|p| children(p, kind::IDENTIFIER))
-        .map(|p| rope.node_text(p))
+        .collect();
+    let used = variable_names(section, rope);
+    let unused_params = params
+        .iter()
+        .filter(|p| !used.contains(&rope.node_text(**p)))
+        .map(|p| (rope.node_text(*p), rope.node_range(*p)))
         .collect();
     Some((
         rope.node_text(name),
         TemplateDef {
             name_range: rope.node_range(name),
-            params,
+            params: params.iter().map(|p| rope.node_text(*p)).collect(),
+            unused_params,
         },
     ))
+}
+
+/// Names of every `%(name)` below `node`.
+fn variable_names(node: Node, rope: &Rope) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == kind::VARIABLE
+            && let Some(ident) = children(node, kind::IDENTIFIER).next()
+        {
+            names.insert(rope.node_text(ident));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    names
 }
 
 /// Collects the template name and argument names of a `use` call.
