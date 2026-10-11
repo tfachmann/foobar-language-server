@@ -11,6 +11,7 @@ use tower_lsp_server::ls_types::{
 };
 use tree_sitter::Tree;
 
+use crate::docs;
 use crate::text::RopeExt;
 use crate::workspace::{FileSnapshot, Workspace, uri_key};
 
@@ -20,6 +21,7 @@ pub fn compute(workspace: &Workspace, file: &Arc<FileSnapshot>) -> Vec<Diagnosti
     collect_symbol_diags(workspace, file, &mut out);
     collect_cycles(workspace, file, &mut out);
     collect_unused_defines(workspace, file, &mut out);
+    collect_shadowed_builtins(file, &mut out);
     out
 }
 
@@ -71,7 +73,7 @@ fn collect_undefined_variables(
     out: &mut Vec<Diagnostic>,
 ) {
     for (name, range) in &file.symbols.var_refs {
-        if !workspace.has_define(file, name) {
+        if !workspace.has_define(file, name) && !docs::is_builtin(name) {
             out.push(make_diag(
                 *range,
                 DiagnosticSeverity::ERROR,
@@ -193,6 +195,20 @@ pub fn surface_includes(workspace: &Workspace, file: &FileSnapshot) -> Vec<Diagn
     out
 }
 
+/// A define named like a built-in variable hides it.
+fn collect_shadowed_builtins(file: &FileSnapshot, out: &mut Vec<Diagnostic>) {
+    for (name, entry) in &file.symbols.defines {
+        if docs::is_builtin(name) {
+            out.push(make_diag(
+                entry.key_range,
+                DiagnosticSeverity::WARNING,
+                "shadows-builtin",
+                format!("`{name}` hides the built-in variable `%({name})`"),
+            ));
+        }
+    }
+}
+
 /// Warning for defines that are never referenced anywhere in the workspace.
 fn collect_unused_defines(workspace: &Workspace, file: &FileSnapshot, out: &mut Vec<Diagnostic>) {
     for (name, entry) in &file.symbols.defines {
@@ -298,15 +314,21 @@ mod tests {
         assert_eq!(missing[0].range.start, Position::new(1, 5));
     }
 
+    /// Built-in variables are defined; a define with a built-in's name is flagged.
     #[test]
     fn undefined_variable() {
         let ws = Workspace::default();
-        let text = "defines\nx: \"1\"\ncmd: \"%(x) %(unknown)\"\n";
+        let text = "defines\nx: \"1\"\nhostname: \"h\"\ncmd: \"%(x) %(unknown) %(curdir)\"\n";
         let doc = Document::from_text(Uri::from_str("file:///x.foobar").unwrap(), text);
         let diags = compute(&ws, &doc.snapshot);
         let undefined = with_code(&diags, "undefined-variable");
         assert_eq!(undefined.len(), 1, "got: {diags:?}");
         assert_eq!(undefined[0].message, "undefined variable: unknown");
+        assert_eq!(
+            with_code(&diags, "shadows-builtin").len(),
+            1,
+            "got: {diags:?}"
+        );
     }
 
     #[test]

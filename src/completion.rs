@@ -8,6 +8,7 @@ use tower_lsp_server::ls_types::{
 };
 use tree_sitter_foobar::{keyword, kind};
 
+use crate::docs::{self, Group};
 use crate::document::Document;
 use crate::text::{RopeExt, TextPos};
 use crate::workspace::Workspace;
@@ -79,6 +80,10 @@ pub fn complete(
                     let detail = format!("\"{}\"", entry.value_text);
                     add(rank + 1, name, CompletionItemKind::CONSTANT, detail);
                 }
+            }
+            for name in docs::names(Group::Builtin) {
+                let detail = "built-in variable".to_string();
+                add(files.len() + 1, name, CompletionItemKind::CONSTANT, detail);
             }
         }
         Context::Template => {
@@ -209,12 +214,18 @@ mod tests {
     }
 
     /// Right after `%(` the tree only has an ERROR node, yet the template scope is still known.
+    ///
+    /// Built-in variables come last.
     #[test]
     fn variables_after_percent_paren() {
         let text = "defines\n  name: \"x\"\ntemplate t(src)\n  cmd: \"%()\"\n  raw: '%()'\n";
         assert_eq!(
             labels(items_at(text, 3, 10)),
-            Some(vec!["src".to_string(), "name".to_string()])
+            Some(
+                ["src", "name", "curdir", "hostname"]
+                    .map(String::from)
+                    .to_vec()
+            )
         );
         // Raw strings don't interpolate.
         assert_eq!(labels(items_at(text, 4, 10)), None);

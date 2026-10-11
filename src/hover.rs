@@ -8,8 +8,8 @@
 use tower_lsp_server::ls_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 use tree_sitter::Node;
 
+use crate::docs::{self, Group};
 use crate::document::Document;
-use crate::keywords::{keyword_doc, process_entry_key_doc};
 use crate::target::{Target, target};
 use crate::text::uri_to_path;
 use crate::workspace::{FileSnapshot, Origin, Workspace};
@@ -29,12 +29,15 @@ pub fn hover(workspace: &Workspace, doc: &Document, params: &HoverParams) -> Opt
 
 fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<String> {
     match target(node, &doc.rope)? {
-        Target::Keyword(word) => keyword_doc(&word).map(str::to_string),
+        Target::Keyword(word) => docs::hover(Group::Keyword, &word),
         Target::IncludePath(raw) => Some(hover_include_path(workspace, doc, &raw)),
         Target::Param { name, .. } => Some(format!("**{name}** - template parameter")),
         Target::DefineUse(name) => hover_variable_use(workspace, doc, &name),
         Target::DefineKey(name) => hover_defines_key(workspace, doc, &name),
-        Target::EntryKey(name) => hover_process_entry_key(&name),
+        Target::EntryKey(name) => Some(
+            docs::hover(Group::ProcessKey, &name)
+                .unwrap_or_else(|| format!("**{name}**\n---\nprocess key (no documentation)")),
+        ),
         Target::ProcessName(name) => hover_process_header(doc, &name),
         Target::TemplateName(name) => {
             let template = doc.snapshot.symbols.templates.get(&name)?;
@@ -56,7 +59,10 @@ fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<Strin
 }
 
 fn hover_variable_use(workspace: &Workspace, doc: &Document, name: &str) -> Option<String> {
-    let (file, entry) = workspace.lookup_define(&doc.snapshot, name)?;
+    // A define hides the built-in variable of the same name.
+    let Some((file, entry)) = workspace.lookup_define(&doc.snapshot, name) else {
+        return docs::hover(Group::Builtin, name);
+    };
     Some(format!(
         "**{name}** = `{value}`\n---\n{location}",
         value = entry.value_text,
@@ -111,12 +117,6 @@ fn hover_process_header(doc: &Document, name: &str) -> Option<String> {
         n = p.entry_count,
         plural = if p.entry_count == 1 { "y" } else { "ies" },
     ))
-}
-
-fn hover_process_entry_key(name: &str) -> Option<String> {
-    process_entry_key_doc(name)
-        .map(|s| s.to_string())
-        .or_else(|| Some(format!("**{name}** - process entry key (no documentation)")))
 }
 
 fn hover_include_path(workspace: &Workspace, doc: &Document, raw: &str) -> String {

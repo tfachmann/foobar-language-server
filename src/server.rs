@@ -330,7 +330,11 @@ impl LanguageServer for Backend {
         let Some(doc) = self.doc(&params.text_document.uri) else {
             return Ok(None);
         };
-        Ok(rename::prepare(&*doc.read().await, &params))
+        Ok(rename::prepare(
+            &self.workspace,
+            &*doc.read().await,
+            &params,
+        ))
     }
 
     async fn rename(&self, params: RenameParams) -> RpcResult<Option<WorkspaceEdit>> {

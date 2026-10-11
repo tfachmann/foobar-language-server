@@ -13,10 +13,11 @@ use crate::workspace::Workspace;
 
 /// The identifier's range, if the cursor is on something renamable.
 pub fn prepare(
+    workspace: &Workspace,
     doc: &Document,
     params: &TextDocumentPositionParams,
 ) -> Option<PrepareRenameResponse> {
-    references::symbol_range(doc, params.position).map(PrepareRenameResponse::Range)
+    references::symbol_range(workspace, doc, params.position).map(PrepareRenameResponse::Range)
 }
 
 pub fn rename(
@@ -31,6 +32,9 @@ pub fn rename(
         )));
     }
     let pos = params.text_document_position.position;
+    if references::symbol_range(workspace, doc, pos).is_none() {
+        return Ok(None);
+    }
     let Some(found) = references::find(workspace, doc, pos, true) else {
         return Ok(None);
     };

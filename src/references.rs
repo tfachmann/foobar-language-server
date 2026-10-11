@@ -8,6 +8,7 @@ use tower_lsp_server::ls_types::{Location, Position, Range, ReferenceParams};
 use tree_sitter::Node;
 use tree_sitter_foobar::kind;
 
+use crate::docs;
 use crate::document::Document;
 use crate::target::{Target, target};
 use crate::text::RopeExt;
@@ -23,9 +24,17 @@ pub fn references(
 }
 
 /// The identifier's range at `pos`, if it names a define, template or parameter.
-pub fn symbol_range(doc: &Document, pos: Position) -> Option<Range> {
+///
+/// A built-in variable is not renamable, unless a define hides it.
+pub fn symbol_range(workspace: &Workspace, doc: &Document, pos: Position) -> Option<Range> {
     let node = doc.node_at(pos)?;
     match target(node, &doc.rope)? {
+        Target::DefineUse(name)
+            if docs::is_builtin(&name)
+                && workspace.lookup_define(&doc.snapshot, &name).is_none() =>
+        {
+            None
+        }
         Target::DefineUse(_)
         | Target::DefineKey(_)
         | Target::TemplateCall(_)
