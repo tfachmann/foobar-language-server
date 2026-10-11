@@ -8,7 +8,7 @@
 use tower_lsp_server::ls_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Range};
 
 use crate::document::Document;
-use crate::symbol::template_param;
+use crate::target::{Target, target};
 use crate::text::{RopeExt, path_to_uri};
 use crate::workspace::Workspace;
 
@@ -17,56 +17,44 @@ pub fn goto(
     doc: &Document,
     params: &GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
-    let pos = params.text_document_position_params.position;
-    let node = doc.node_at(pos)?;
-
-    let parent_kind = node.parent().map(|p| p.kind());
-
-    // Variable reference: %(name) -> template parameter, else matching `name:` define.
-    if node.kind() == "identifier" && parent_kind == Some("variable") {
-        if let Some(param) = template_param(node, &doc.rope) {
-            return Some(GotoDefinitionResponse::Scalar(Location {
-                uri: doc.uri.clone(),
-                range: doc.rope.node_range(param),
-            }));
+    let node = doc.node_at(params.text_document_position_params.position)?;
+    let location = match target(node, &doc.rope)? {
+        Target::Param { decl, .. } => Location {
+            uri: doc.uri.clone(),
+            range: doc.rope.node_range(decl),
+        },
+        Target::DefineUse(name) => {
+            let (file, entry) = workspace.lookup_define(&doc.snapshot, &name)?;
+            Location {
+                uri: file.uri.clone(),
+                range: entry.key_range,
+            }
         }
-        let name = doc.rope.node_text(node);
-        let (file, entry) = workspace.lookup_define(&doc.snapshot, &name)?;
-        return Some(GotoDefinitionResponse::Scalar(Location {
-            uri: file.uri.clone(),
-            range: entry.key_range,
-        }));
-    }
-
-    // Template call: `use name(...)` -> template definition.
-    if node.kind() == "identifier" && parent_kind == Some("use") {
-        let name = doc.rope.node_text(node);
-        let (file, template) = workspace.lookup_template(&doc.snapshot, &name)?;
-        return Some(GotoDefinitionResponse::Scalar(Location {
-            uri: file.uri.clone(),
-            range: template.name_range,
-        }));
-    }
-
-    // Include path: `include some_other.foobar` -> file start.
-    if node.kind() == "path" && parent_kind == Some("include") {
-        let raw = doc.rope.node_text(node).trim().to_string();
-        let resolved = workspace.resolve(&doc.uri, &raw)?;
-        if !resolved.exists {
-            return None;
+        Target::TemplateCall(name) => {
+            let (file, template) = workspace.lookup_template(&doc.snapshot, &name)?;
+            Location {
+                uri: file.uri.clone(),
+                range: template.name_range,
+            }
         }
-        // Prefer the editor's URI if the file is open.
-        let uri = match workspace.file(&resolved.path) {
-            Some(file) => file.uri.clone(),
-            None => path_to_uri(&resolved.path)?,
-        };
-        return Some(GotoDefinitionResponse::Scalar(Location {
-            uri,
-            range: Range::default(),
-        }));
-    }
-
-    None
+        Target::IncludePath(raw) => {
+            let resolved = workspace.resolve(&doc.uri, &raw)?;
+            if !resolved.exists {
+                return None;
+            }
+            // Prefer the editor's URI if the file is open.
+            let uri = match workspace.file(&resolved.path) {
+                Some(file) => file.uri.clone(),
+                None => path_to_uri(&resolved.path)?,
+            };
+            Location {
+                uri,
+                range: Range::default(),
+            }
+        }
+        _ => return None,
+    };
+    Some(GotoDefinitionResponse::Scalar(location))
 }
 
 #[cfg(test)]

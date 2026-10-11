@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use ropey::Rope;
 use tower_lsp_server::ls_types::Range;
 use tree_sitter::{Node, Tree};
+use tree_sitter_foobar::kind;
 
 use crate::text::RopeExt;
 
@@ -75,13 +76,13 @@ impl SymbolIndex {
         let mut cursor = root.walk();
         for section in root.children(&mut cursor) {
             match section.kind() {
-                "section_defines" => defines.extend(collect_defines(section, rope)),
-                "section_process" => {
+                kind::SECTION_DEFINES => defines.extend(collect_defines(section, rope)),
+                kind::SECTION_PROCESS => {
                     processes.push(collect_process(section, rope));
-                    uses.extend(children(section, "use").map(|u| collect_use(u, rope)));
+                    uses.extend(children(section, kind::USE).map(|u| collect_use(u, rope)));
                 }
-                "section_template" => templates.extend(collect_template(section, rope)),
-                "include" => {
+                kind::SECTION_TEMPLATE => templates.extend(collect_template(section, rope)),
+                kind::INCLUDE => {
                     if let Some(r) = collect_include(section, rope) {
                         includes.push(r);
                     }
@@ -106,14 +107,14 @@ fn collect_defines(section: Node, rope: &Rope) -> Vec<(String, DefineEntry)> {
     let mut cursor = section.walk();
     section
         .children(&mut cursor)
-        .filter(|c| c.kind() == "entry")
+        .filter(|c| c.kind() == kind::ENTRY)
         .filter_map(|entry| {
             let key_node = entry
                 .children(&mut entry.walk())
-                .find(|c| c.kind() == "identifier")?;
+                .find(|c| c.kind() == kind::IDENTIFIER)?;
             let value_text = entry
                 .children(&mut entry.walk())
-                .find(|c| matches!(c.kind(), "string" | "raw_string"))
+                .find(|c| matches!(c.kind(), kind::STRING | kind::RAW_STRING))
                 .map(|v| strip_quotes(&rope.node_text(v)))
                 .unwrap_or_default();
             Some((
@@ -134,21 +135,21 @@ fn collect_process(section: Node, rope: &Rope) -> ProcessHeader {
     ProcessHeader {
         name: children
             .iter()
-            .find(|c| c.kind() == "name")
+            .find(|c| c.kind() == kind::NAME)
             .map(|n| rope.node_text(*n).trim().to_string())
             .unwrap_or_default(),
         entry_count: children
             .iter()
-            .filter(|c| matches!(c.kind(), "entry" | "use"))
+            .filter(|c| matches!(c.kind(), kind::ENTRY | kind::USE))
             .count(),
     }
 }
 
 /// Collects the name and parameter list of a `template` section.
 fn collect_template(section: Node, rope: &Rope) -> Option<(String, TemplateDef)> {
-    let name = children(section, "identifier").next()?;
-    let params = children(section, "parameters")
-        .flat_map(|p| children(p, "identifier"))
+    let name = children(section, kind::IDENTIFIER).next()?;
+    let params = children(section, kind::PARAMETERS)
+        .flat_map(|p| children(p, kind::IDENTIFIER))
         .map(|p| rope.node_text(p))
         .collect();
     Some((
@@ -162,10 +163,10 @@ fn collect_template(section: Node, rope: &Rope) -> Option<(String, TemplateDef)>
 
 /// Collects the template name and argument names of a `use` call.
 fn collect_use(node: Node, rope: &Rope) -> UseRef {
-    let name = children(node, "identifier").next();
-    let args = children(node, "arguments")
-        .flat_map(|a| children(a, "argument"))
-        .filter_map(|a| children(a, "identifier").next())
+    let name = children(node, kind::IDENTIFIER).next();
+    let args = children(node, kind::ARGUMENTS)
+        .flat_map(|a| children(a, kind::ARGUMENT))
+        .filter_map(|a| children(a, kind::IDENTIFIER).next())
         .map(|id| (rope.node_text(id), rope.node_range(id)))
         .collect();
     UseRef {
@@ -179,7 +180,7 @@ fn collect_use(node: Node, rope: &Rope) -> UseRef {
 fn collect_include(section: Node, rope: &Rope) -> Option<IncludeRef> {
     let path_node = section
         .children(&mut section.walk())
-        .find(|c| c.kind() == "path")?;
+        .find(|c| c.kind() == kind::PATH)?;
     Some(IncludeRef {
         raw_path: rope.node_text(path_node).trim().to_string(),
         path_range: rope.node_range(path_node),
@@ -191,11 +192,11 @@ fn collect_refs(root: Node, rope: &Rope) -> Vec<(String, Range)> {
     let mut out: Vec<(String, Range)> = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.kind() == "variable" {
+        if node.kind() == kind::VARIABLE {
             let mut walker = node.walk();
             if let Some(id) = node
                 .children(&mut walker)
-                .find(|c| c.kind() == "identifier")
+                .find(|c| c.kind() == kind::IDENTIFIER)
                 && template_param(id, rope).is_none()
             {
                 out.push((rope.node_text(id), rope.node_range(id)));
@@ -214,10 +215,10 @@ fn collect_refs(root: Node, rope: &Rope) -> Vec<(String, Range)> {
 /// Inside a template body, `%(name)` means the parameter when the template declares `name`.
 pub fn template_param<'a>(ident: Node<'a>, rope: &Rope) -> Option<Node<'a>> {
     let template = std::iter::successors(ident.parent(), |n| n.parent())
-        .find(|n| n.kind() == "section_template")?;
+        .find(|n| n.kind() == kind::SECTION_TEMPLATE)?;
     let name = rope.node_text(ident);
-    children(template, "parameters")
-        .flat_map(|p| children(p, "identifier"))
+    children(template, kind::PARAMETERS)
+        .flat_map(|p| children(p, kind::IDENTIFIER))
         .find(|p| rope.node_text(*p) == name)
 }
 

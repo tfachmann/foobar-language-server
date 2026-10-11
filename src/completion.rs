@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
 };
+use tree_sitter_foobar::{keyword, kind};
 
 use crate::document::Document;
 use crate::text::{RopeExt, TextPos};
@@ -32,7 +33,7 @@ pub fn complete(
     let pos = params.text_document_position.position;
     let node = doc.node_at(pos)?;
     // `%(` in a raw string or a comment is plain text.
-    if matches!(node.kind(), "raw_string" | "comment") {
+    if matches!(node.kind(), kind::RAW_STRING | kind::COMMENT) {
         return None;
     }
     let cursor = doc.rope.lsp_position_to_text_pos(pos);
@@ -59,7 +60,7 @@ pub fn complete(
         Context::Variable => {
             // Template parameters shadow defines of the same name.
             let template = std::iter::successors(Some(node), |n| n.parent())
-                .find(|n| n.kind() == "section_template")
+                .find(|n| n.kind() == kind::SECTION_TEMPLATE)
                 .and_then(|t| t.named_child(0))
                 .and_then(|name| {
                     let name = doc.rope.node_text(name);
@@ -114,7 +115,7 @@ fn context(before: &str) -> Option<Context> {
     if typed.ends_with("%(") {
         return Some(Context::Variable);
     }
-    let rest = typed.trim_start().strip_prefix("use")?;
+    let rest = typed.trim_start().strip_prefix(keyword::USE)?;
     (!rest.is_empty() && rest.trim().is_empty()).then_some(Context::Template)
 }
 
@@ -122,8 +123,10 @@ fn context(before: &str) -> Option<Context> {
 fn call_before(doc: &Document, cursor: TextPos) -> Option<String> {
     let start = (0..=cursor.point.row).rev().find_map(|row| {
         match doc.rope.line(row).to_string().split_whitespace().next() {
-            Some("use") => Some(Some(row)),
-            Some("defines" | "process" | "template" | "include") => Some(None),
+            Some(keyword::USE) => Some(Some(row)),
+            Some(keyword::DEFINES | keyword::PROCESS | keyword::TEMPLATE | keyword::INCLUDE) => {
+                Some(None)
+            }
             _ => None,
         }
     })??;
@@ -136,7 +139,10 @@ fn call_before(doc: &Document, cursor: TextPos) -> Option<String> {
 
 /// `use name(arg: "...", ` + partial argument name, from a [`call_before`] text.
 fn argument_context(call: &str) -> Option<Context> {
-    let (template, args) = call.trim_start().strip_prefix("use")?.split_once('(')?;
+    let (template, args) = call
+        .trim_start()
+        .strip_prefix(keyword::USE)?
+        .split_once('(')?;
     let mut given = Vec::new();
     // The current argument's text outside quotes; values may contain `,` and `)`.
     let mut current = String::new();

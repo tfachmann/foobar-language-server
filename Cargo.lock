@@ -1153,6 +1153,7 @@ name = "tree-sitter-foobar"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "serde_json",
  "tree-sitter-language",
 ]
 

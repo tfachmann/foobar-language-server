@@ -10,8 +10,8 @@ use tree_sitter::Node;
 
 use crate::document::Document;
 use crate::keywords::{keyword_doc, process_entry_key_doc};
-use crate::symbol::template_param;
-use crate::text::{RopeExt, uri_to_path};
+use crate::target::{Target, target};
+use crate::text::uri_to_path;
 use crate::workspace::{FileSnapshot, Origin, Workspace};
 
 pub fn hover(workspace: &Workspace, doc: &Document, params: &HoverParams) -> Option<Hover> {
@@ -28,54 +28,15 @@ pub fn hover(workspace: &Workspace, doc: &Document, params: &HoverParams) -> Opt
 }
 
 fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<String> {
-    // Case 1: keyword tokens. Anonymous, parent is the section node.
-    if let Some(parent) = node.parent()
-        && matches!(
-            parent.kind(),
-            "section_defines" | "section_process" | "section_template" | "use" | "include"
-        )
-        && !node.is_named()
-        && let Some(doc_md) = keyword_doc(&doc.rope.node_text(node))
-    {
-        return Some(doc_md.to_string());
-    }
-
-    // Case 2: hover on the (path) node of an include.
-    if node.kind() == "path" && node.parent().is_some_and(|p| p.kind() == "include") {
-        return Some(hover_include_path(workspace, doc, node));
-    }
-
-    match (node.kind(), node.parent().map(|p| p.kind())) {
-        // Case 3: identifier inside a variable use, e.g. %(file_name).
-        ("identifier", Some("variable")) => {
-            let name = doc.rope.node_text(node);
-            if template_param(node, &doc.rope).is_some() {
-                return Some(format!("**{name}** - template parameter"));
-            }
-            hover_variable_use(workspace, doc, &name)
-        }
-        // Case 4 / 5: identifier as an entry key.
-        ("identifier", Some("entry")) => {
-            let name = doc.rope.node_text(node);
-            let in_defines = node
-                .parent()
-                .and_then(|e| e.parent())
-                .map(|s| s.kind() == "section_defines")
-                .unwrap_or(false);
-            if in_defines {
-                hover_defines_key(workspace, doc, &name)
-            } else {
-                hover_process_entry_key(&name)
-            }
-        }
-        // Case 6: process header name.
-        ("name", Some("section_process")) => {
-            let name = doc.rope.node_text(node).trim().to_string();
-            hover_process_header(doc, &name)
-        }
-        // Case 7: template name in its definition.
-        ("identifier", Some("section_template")) => {
-            let name = doc.rope.node_text(node);
+    match target(node, &doc.rope)? {
+        Target::Keyword(word) => keyword_doc(&word).map(str::to_string),
+        Target::IncludePath(raw) => Some(hover_include_path(workspace, doc, &raw)),
+        Target::Param { name, .. } => Some(format!("**{name}** - template parameter")),
+        Target::DefineUse(name) => hover_variable_use(workspace, doc, &name),
+        Target::DefineKey(name) => hover_defines_key(workspace, doc, &name),
+        Target::EntryKey(name) => hover_process_entry_key(&name),
+        Target::ProcessName(name) => hover_process_header(doc, &name),
+        Target::TemplateName(name) => {
             let template = doc.snapshot.symbols.templates.get(&name)?;
             Some(format!(
                 "**template** `{}`\n---\n{}",
@@ -83,9 +44,7 @@ fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<Strin
                 usage(workspace.count_uses(&name)),
             ))
         }
-        // Case 8: template name in a `use` call.
-        ("identifier", Some("use")) => {
-            let name = doc.rope.node_text(node);
+        Target::TemplateCall(name) => {
             let (file, template) = workspace.lookup_template(&doc.snapshot, &name)?;
             Some(format!(
                 "**template** `{}`\n---\n{}",
@@ -93,7 +52,6 @@ fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<Strin
                 location(doc, &file, template.name_range.start.line + 1),
             ))
         }
-        _ => None,
     }
 }
 
@@ -161,9 +119,8 @@ fn hover_process_entry_key(name: &str) -> Option<String> {
         .or_else(|| Some(format!("**{name}** - process entry key (no documentation)")))
 }
 
-fn hover_include_path(workspace: &Workspace, doc: &Document, node: Node<'_>) -> String {
-    let raw = doc.rope.node_text(node).trim().to_string();
-    let resolved = workspace.resolve(&doc.uri, &raw);
+fn hover_include_path(workspace: &Workspace, doc: &Document, raw: &str) -> String {
+    let resolved = workspace.resolve(&doc.uri, raw);
     let mut body = format!("**include** `{raw}`\n---\n");
     match resolved {
         Some(r) => {

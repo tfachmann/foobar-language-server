@@ -6,19 +6,12 @@
 
 use tower_lsp_server::ls_types::{Location, Position, Range, ReferenceParams};
 use tree_sitter::Node;
+use tree_sitter_foobar::kind;
 
 use crate::document::Document;
-use crate::symbol::template_param;
+use crate::target::{Target, target};
 use crate::text::RopeExt;
 use crate::workspace::Workspace;
-
-/// What the identifier under the cursor names.
-enum Target<'a> {
-    Define(String),
-    Template(String),
-    /// A parameter of the given `section_template`.
-    Param(Node<'a>, String),
-}
 
 pub fn references(
     workspace: &Workspace,
@@ -32,7 +25,14 @@ pub fn references(
 /// The identifier's range at `pos`, if it names a define, template or parameter.
 pub fn symbol_range(doc: &Document, pos: Position) -> Option<Range> {
     let node = doc.node_at(pos)?;
-    target(doc, node).map(|_| doc.rope.node_range(node))
+    match target(node, &doc.rope)? {
+        Target::DefineUse(_)
+        | Target::DefineKey(_)
+        | Target::TemplateCall(_)
+        | Target::TemplateName(_)
+        | Target::Param { .. } => Some(doc.rope.node_range(node)),
+        _ => None,
+    }
 }
 
 /// Every location naming the symbol at `pos`, sorted; `None` if the cursor is not on one.
@@ -43,8 +43,8 @@ pub fn find(
     declaration: bool,
 ) -> Option<Vec<Location>> {
     let node = doc.node_at(pos)?;
-    let mut found: Vec<Location> = match target(doc, node)? {
-        Target::Define(name) => workspace
+    let mut found: Vec<Location> = match target(node, &doc.rope)? {
+        Target::DefineUse(name) | Target::DefineKey(name) => workspace
             .all_files()
             .iter()
             .flat_map(|file| {
@@ -56,7 +56,7 @@ pub fn find(
                     .collect::<Vec<_>>()
             })
             .collect(),
-        Target::Template(name) => workspace
+        Target::TemplateCall(name) | Target::TemplateName(name) => workspace
             .all_files()
             .iter()
             .flat_map(|file| {
@@ -68,7 +68,7 @@ pub fn find(
                     .collect::<Vec<_>>()
             })
             .collect(),
-        Target::Param(template, name) => {
+        Target::Param { template, name, .. } => {
             let mut found = param_refs(doc, template, &name, declaration);
             // Argument names in calls: `use t(name: ...)`.
             let called = doc.rope.node_text(template.named_child(0)?);
@@ -80,30 +80,13 @@ pub fn find(
             }));
             found
         }
+        _ => return None,
     };
     found.sort_by(|a, b| {
         let key = |l: &Location| (l.uri.as_str().to_owned(), l.range.start);
         key(a).cmp(&key(b))
     });
     Some(found)
-}
-
-fn target<'a>(doc: &Document, node: Node<'a>) -> Option<Target<'a>> {
-    if node.kind() != "identifier" {
-        return None;
-    }
-    let name = doc.rope.node_text(node);
-    let parent = node.parent()?;
-    match parent.kind() {
-        "variable" => match template_param(node, &doc.rope) {
-            Some(param) => Some(Target::Param(param.parent()?.parent()?, name)),
-            None => Some(Target::Define(name)),
-        },
-        "parameters" => Some(Target::Param(parent.parent()?, name)),
-        "entry" if parent.parent()?.kind() == "section_defines" => Some(Target::Define(name)),
-        "use" | "section_template" => Some(Target::Template(name)),
-        _ => None,
-    }
 }
 
 /// `%(name)` uses inside `template`, plus the parameter itself if `declaration`.
@@ -113,11 +96,11 @@ fn param_refs(doc: &Document, template: Node, name: &str, declaration: bool) -> 
     while let Some(node) = stack.pop() {
         let parent = node.parent().map(|p| p.kind());
         let wanted = match parent {
-            Some("variable") => true,
-            Some("parameters") => declaration,
+            Some(kind::VARIABLE) => true,
+            Some(kind::PARAMETERS) => declaration,
             _ => false,
         };
-        if node.kind() == "identifier" && wanted && doc.rope.node_text(node) == name {
+        if node.kind() == kind::IDENTIFIER && wanted && doc.rope.node_text(node) == name {
             found.push(location(&doc.uri, doc.rope.node_range(node)));
         }
         let mut cursor = node.walk();

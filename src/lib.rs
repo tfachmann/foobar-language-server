@@ -2,8 +2,8 @@
 //!
 //! - Syntax (every tool): [`syntax`], [`text`], [`format`].
 //! - Semantic core (language server and linter): [`symbol`], [`workspace`], [`diagnostics`].
-//! - Editor: [`document`], [`hover`], [`definition`], [`completion`], [`references`], [`rename`],
-//!   [`keywords`], [`server`].
+//! - Editor: [`document`], [`target`], [`hover`], [`definition`], [`completion`], [`references`],
+//!   [`rename`], [`keywords`], [`server`].
 //! - Command line: [`cli`].
 
 pub mod cli;
@@ -19,5 +19,6 @@ pub mod rename;
 pub mod server;
 pub mod symbol;
 pub mod syntax;
+pub mod target;
 pub mod text;
 pub mod workspace;
