@@ -69,7 +69,8 @@ include common.foobar
 
 # Process keys
 
-Entries of a `process`. They are also valid inside a `template`.
+Entries of a `process`. They are also valid inside a `template`. This is the complete list: any
+other key is an error.
 
 ## command
 

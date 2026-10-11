@@ -60,6 +60,8 @@ pub struct SymbolIndex {
     pub includes: Vec<IncludeRef>,
     /// Every `%(name)` reference to a define (template parameters excluded).
     pub var_refs: Vec<(String, Range)>,
+    /// Keys of `process` and `template` entries; only documented process keys are valid.
+    pub entry_keys: Vec<(String, Range)>,
 }
 
 impl SymbolIndex {
@@ -72,6 +74,7 @@ impl SymbolIndex {
         let mut templates: HashMap<String, TemplateDef> = HashMap::new();
         let mut uses: Vec<UseRef> = Vec::new();
         let mut includes: Vec<IncludeRef> = Vec::new();
+        let mut entry_keys: Vec<(String, Range)> = Vec::new();
 
         let mut cursor = root.walk();
         for section in root.children(&mut cursor) {
@@ -79,9 +82,13 @@ impl SymbolIndex {
                 kind::SECTION_DEFINES => defines.extend(collect_defines(section, rope)),
                 kind::SECTION_PROCESS => {
                     processes.push(collect_process(section, rope));
+                    entry_keys.extend(collect_entry_keys(section, rope));
                     uses.extend(children(section, kind::USE).map(|u| collect_use(u, rope)));
                 }
-                kind::SECTION_TEMPLATE => templates.extend(collect_template(section, rope)),
+                kind::SECTION_TEMPLATE => {
+                    templates.extend(collect_template(section, rope));
+                    entry_keys.extend(collect_entry_keys(section, rope));
+                }
                 kind::INCLUDE => {
                     if let Some(r) = collect_include(section, rope) {
                         includes.push(r);
@@ -98,8 +105,17 @@ impl SymbolIndex {
             uses,
             includes,
             var_refs: collect_refs(root, rope),
+            entry_keys,
         }
     }
+}
+
+/// Keys of the entries of a `process` or `template` section.
+fn collect_entry_keys(section: Node, rope: &Rope) -> Vec<(String, Range)> {
+    children(section, kind::ENTRY)
+        .filter_map(|entry| children(entry, kind::IDENTIFIER).next())
+        .map(|key| (rope.node_text(key), rope.node_range(key)))
+        .collect()
 }
 
 /// Collects the `key: value` entries of a `defines` section.

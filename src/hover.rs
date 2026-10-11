@@ -36,7 +36,7 @@ fn render(workspace: &Workspace, doc: &Document, node: Node<'_>) -> Option<Strin
         Target::DefineKey(name) => hover_defines_key(workspace, doc, &name),
         Target::EntryKey(name) => Some(
             docs::hover(Group::ProcessKey, &name)
-                .unwrap_or_else(|| format!("**{name}**\n---\nprocess key (no documentation)")),
+                .unwrap_or_else(|| format!("**{name}**\n---\nunknown process key")),
         ),
         Target::ProcessName(name) => hover_process_header(doc, &name),
         Target::TemplateName(name) => {

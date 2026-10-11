@@ -1,10 +1,11 @@
-//! Completion: defines and template parameters after `%(`, template names after `use`, and
-//! argument names inside `use name(...)`.
+//! Completion: defines and template parameters after `%(`, template names after `use`, argument
+//! names inside `use name(...)`, and process keys at the start of a process or template entry.
 
 use std::collections::HashSet;
 
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
+    CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionParams,
+    CompletionResponse, Documentation, MarkupContent, MarkupKind,
 };
 use tree_sitter_foobar::{keyword, kind};
 
@@ -24,6 +25,8 @@ enum Context {
         template: String,
         given: Vec<String>,
     },
+    /// A key at the start of a process or template entry; `use` calls only fit in processes.
+    ProcessKey { in_process: bool },
 }
 
 pub fn complete(
@@ -40,20 +43,17 @@ pub fn complete(
     let cursor = doc.rope.lsp_position_to_text_pos(pos);
     let line_start = doc.rope.line_to_char(cursor.point.row);
     let before = doc.rope.slice(line_start..cursor.char).to_string();
-    let context = context(&before).or_else(|| argument_context(&call_before(doc, cursor)?))?;
+    let context = context(&before)
+        .or_else(|| argument_context(&call_before(doc, cursor)?))
+        .or_else(|| key_context(doc, cursor.point.row, &before))?;
 
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut seen = HashSet::new();
     // `rank` puts nearer symbols first; the nearest of equal names wins.
-    let mut add = |rank: usize, label: &str, kind: CompletionItemKind, detail: String| {
-        if seen.insert(label.to_string()) {
-            items.push(CompletionItem {
-                label: label.to_string(),
-                kind: Some(kind),
-                detail: Some(detail),
-                sort_text: Some(format!("{rank:04}{label}")),
-                ..CompletionItem::default()
-            });
+    let mut add = |rank: usize, item: CompletionItem| {
+        if seen.insert(item.label.clone()) {
+            let sort_text = Some(format!("{rank:04}{}", item.label));
+            items.push(CompletionItem { sort_text, ..item });
         }
     };
     let files = workspace.visible(&doc.snapshot);
@@ -68,29 +68,47 @@ pub fn complete(
                     doc.snapshot.symbols.templates.get(&name)
                 });
             for param in template.iter().flat_map(|t| &t.params) {
+                let label_details = described("template parameter");
                 add(
                     0,
-                    param,
-                    CompletionItemKind::VARIABLE,
-                    "template parameter".to_string(),
+                    CompletionItem {
+                        label_details,
+                        ..item(param, CompletionItemKind::VARIABLE)
+                    },
                 );
             }
             for (rank, file) in files.iter().enumerate() {
                 for (name, entry) in &file.symbols.defines {
-                    let detail = format!("\"{}\"", entry.value_text);
-                    add(rank + 1, name, CompletionItemKind::CONSTANT, detail);
+                    let detail = Some(format!("\"{}\"", entry.value_text));
+                    add(
+                        rank + 1,
+                        CompletionItem {
+                            detail,
+                            ..item(name, CompletionItemKind::CONSTANT)
+                        },
+                    );
                 }
             }
-            for name in docs::names(Group::Builtin) {
-                let detail = "built-in variable".to_string();
-                add(files.len() + 1, name, CompletionItemKind::CONSTANT, detail);
+            for builtin in docs::all(Group::Builtin) {
+                let builtin_item = CompletionItem {
+                    label_details: described(builtin.group.label()),
+                    documentation: Some(markdown(builtin.documentation())),
+                    ..item(&builtin.name, CompletionItemKind::CONSTANT)
+                };
+                add(files.len() + 1, builtin_item);
             }
         }
         Context::Template => {
             for (rank, file) in files.iter().enumerate() {
                 for (name, template) in &file.symbols.templates {
-                    let detail = template.signature(name);
-                    add(rank, name, CompletionItemKind::FUNCTION, detail);
+                    let detail = Some(template.signature(name));
+                    add(
+                        rank,
+                        CompletionItem {
+                            detail,
+                            ..item(name, CompletionItemKind::FUNCTION)
+                        },
+                    );
                 }
             }
         }
@@ -99,18 +117,58 @@ pub fn complete(
             let missing = def.params.iter().filter(|p| !given.contains(p));
             for (i, param) in missing.enumerate() {
                 items.push(CompletionItem {
-                    label: param.clone(),
-                    kind: Some(CompletionItemKind::PROPERTY),
                     detail: Some(def.signature(&template)),
                     // Declaration order; accepting inserts the colon too.
                     sort_text: Some(format!("{i:04}")),
                     insert_text: Some(format!("{param}: ")),
-                    ..CompletionItem::default()
+                    ..item(param, CompletionItemKind::PROPERTY)
+                });
+            }
+        }
+        Context::ProcessKey { in_process } => {
+            for key in docs::all(Group::ProcessKey) {
+                items.push(CompletionItem {
+                    label_details: described(key.group.label()),
+                    documentation: Some(markdown(key.documentation())),
+                    insert_text: Some(format!("{}: ", key.name)),
+                    ..item(&key.name, CompletionItemKind::PROPERTY)
+                });
+            }
+            if in_process && let Some(doc) = docs::get(Group::Keyword, keyword::USE) {
+                items.push(CompletionItem {
+                    label_details: described(doc.group.label()),
+                    documentation: Some(markdown(doc.documentation())),
+                    // The template name follows; typing it completes templates.
+                    insert_text: Some(format!("{} ", keyword::USE)),
+                    ..item(keyword::USE, CompletionItemKind::KEYWORD)
                 });
             }
         }
     }
     Some(CompletionResponse::Array(items))
+}
+
+fn item(label: &str, kind: CompletionItemKind) -> CompletionItem {
+    CompletionItem {
+        label: label.to_string(),
+        kind: Some(kind),
+        ..CompletionItem::default()
+    }
+}
+
+/// Editors render `detail` as code in the file's language.
+fn described(text: &str) -> Option<CompletionItemLabelDetails> {
+    Some(CompletionItemLabelDetails {
+        detail: None,
+        description: Some(text.to_string()),
+    })
+}
+
+fn markdown(value: String) -> Documentation {
+    Documentation::MarkupContent(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value,
+    })
 }
 
 /// What the text between line start and cursor is about to become.
@@ -122,6 +180,34 @@ fn context(before: &str) -> Option<Context> {
     }
     let rest = typed.trim_start().strip_prefix(keyword::USE)?;
     (!rest.is_empty() && rest.trim().is_empty()).then_some(Context::Template)
+}
+
+/// The start of a process or template entry: only a partial key before the cursor.
+fn key_context(doc: &Document, row: usize, before: &str) -> Option<Context> {
+    let partial = before.trim_start();
+    if !partial
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    // The nearest section keyword above decides; indentation means nothing in foobar.
+    let sections = [
+        keyword::DEFINES,
+        keyword::PROCESS,
+        keyword::TEMPLATE,
+        keyword::INCLUDE,
+    ];
+    let section = (0..row).rev().find_map(|r| {
+        let line = doc.rope.line(r).to_string();
+        let first = line.split_whitespace().next()?;
+        sections.into_iter().find(|s| *s == first)
+    })?;
+    match section {
+        keyword::PROCESS => Some(Context::ProcessKey { in_process: true }),
+        keyword::TEMPLATE => Some(Context::ProcessKey { in_process: false }),
+        _ => None,
+    }
 }
 
 /// Text from the start of the `use` line up to the cursor: a call may span lines.
@@ -253,5 +339,19 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "compile");
         assert_eq!(items[0].detail.as_deref(), Some("compile(src, dst)"));
+    }
+
+    /// The documented process keys (and `use` in processes) at an entry start, not in `defines`.
+    #[test]
+    fn process_keys_at_entry_start() {
+        let text = "process p\n  co\ndefines\n  co\ntemplate t()\n  co\n";
+        let items = items_at(text, 1, 4).unwrap();
+        let command = items.iter().find(|i| i.label == "command").unwrap();
+        assert_eq!(command.insert_text.as_deref(), Some("command: "));
+        assert!(items.iter().any(|i| i.label == "use"));
+        assert!(items_at(text, 3, 4).is_none());
+        // Templates take entries only, no `use` calls.
+        let in_template = items_at(text, 5, 4).unwrap();
+        assert!(in_template.iter().all(|i| i.label != "use"));
     }
 }

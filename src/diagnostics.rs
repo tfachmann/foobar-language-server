@@ -65,6 +65,7 @@ fn collect_symbol_diags(
     collect_undefined_variables(workspace, file, out);
     collect_missing_includes(workspace, file, out);
     collect_template_uses(workspace, file, out);
+    collect_unknown_keys(file, out);
 }
 
 fn collect_undefined_variables(
@@ -193,6 +194,20 @@ pub fn surface_includes(workspace: &Workspace, file: &FileSnapshot) -> Vec<Diagn
         );
     }
     out
+}
+
+/// Process and template entries may only use the documented process keys.
+fn collect_unknown_keys(file: &FileSnapshot, out: &mut Vec<Diagnostic>) {
+    for (key, range) in &file.symbols.entry_keys {
+        if !docs::is_process_key(key) {
+            out.push(make_diag(
+                *range,
+                DiagnosticSeverity::ERROR,
+                "unknown-key",
+                format!("unknown process key `{key}`"),
+            ));
+        }
+    }
 }
 
 /// A define named like a built-in variable hides it.
@@ -422,6 +437,7 @@ mod tests {
             1,
             "got: {diags:?}"
         );
+        assert_eq!(with_code(&diags, "unknown-key").len(), 1, "got: {diags:?}");
     }
 
     /// A valid template example (the one shown in the talk) produces no diagnostics.
