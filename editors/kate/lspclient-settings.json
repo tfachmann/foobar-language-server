@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "foobar": {
+      "command": ["foobar", "lsp"],
+      "rootIndicationFileNames": [".git"],
+      "highlightingModeRegex": "^foobar$"
+    }
+  }
+}

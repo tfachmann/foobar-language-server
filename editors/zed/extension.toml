@@ -1,0 +1,17 @@
+id = "foobar"
+name = "foobar"
+version = "0.1.0"
+schema_version = 1
+authors = ["tfachmann <tfachmann@proton.me>"]
+description = "foobar config DSL: tree-sitter highlighting and foobar-language-server"
+repository = "https://github.com/tfachmann/foobar-language-server"
+
+# Zed builds the grammar from this commit. For unpushed grammar changes, point `repository` at a
+# local checkout (file:///path/to/tree-sitter-foobar) and `rev` at a local commit.
+[grammars.foobar]
+repository = "https://github.com/tfachmann/tree-sitter-foobar"
+rev = "70584d3a92702bedbf2196887a60629841f850ad"
+
+[language_servers.foobar]
+name = "foobar-language-server"
+languages = ["foobar"]

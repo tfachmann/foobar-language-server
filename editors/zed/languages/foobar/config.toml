@@ -1,0 +1,10 @@
+name = "foobar"
+grammar = "foobar"
+path_suffixes = ["foobar"]
+line_comments = ["# "]
+tab_size = 2
+# Typing `(` or `"` inserts the closing one too, so a half-typed value stays balanced.
+brackets = [
+  { start = "(", end = ")", close = true, newline = false },
+  { start = "\"", end = "\"", close = true, newline = false },
+]

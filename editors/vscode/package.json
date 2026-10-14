@@ -1,0 +1,67 @@
+{
+  "name": "foobar",
+  "displayName": "foobar",
+  "description": "foobar config DSL: syntax highlighting and foobar-language-server",
+  "version": "0.1.0",
+  "publisher": "tfachmann",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tfachmann/foobar-language-server"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters",
+    "Linters"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "foobar",
+        "aliases": [
+          "foobar"
+        ],
+        "extensions": [
+          ".foobar"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "foobar",
+        "scopeName": "source.foobar",
+        "path": "./syntaxes/foobar.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "foobar",
+      "properties": {
+        "foobar.server.path": {
+          "type": "string",
+          "default": "foobar",
+          "description": "The foobar binary; the language server runs as `foobar lsp`."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "esbuild src/extension.ts --bundle --minify --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "package": "vsce package --no-dependencies --skip-license"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "~1.75.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.0.0"
+  }
+}

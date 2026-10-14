@@ -1,0 +1,5 @@
+# Written by Zed when installing the dev extension, and by cargo.
+target/
+extension.wasm
+grammars/
+Cargo.lock

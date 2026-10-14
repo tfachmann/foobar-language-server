@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE language>
+<!--
+  foobar syntax for Kate (KSyntaxHighlighting). Kate does not use tree-sitter, so this restates
+  tree-sitter-foobar/queries/highlights.scm. Copy to
+  ~/.local/share/org.kde.syntax-highlighting/syntax/foobar.xml
+  The language name "foobar" is also what the LSP client setting `highlightingModeRegex` matches.
+-->
+<language name="foobar" section="Configuration" extensions="*.foobar" version="1" kateversion="5.0" author="tfachmann" license="MIT">
+  <highlighting>
+    <list name="keywords">
+      <item>defines</item>
+      <item>process</item>
+      <item>template</item>
+      <item>use</item>
+      <item>include</item>
+    </list>
+    <contexts>
+      <context name="Normal" attribute="Normal Text" lineEndContext="#stay">
+        <DetectChar char="#" attribute="Comment" context="Comment"/>
+        <RegExpr String="^\s*process\b" attribute="Keyword" context="ProcessName"/>
+        <RegExpr String="^\s*include\b" attribute="Keyword" context="IncludePath"/>
+        <keyword String="keywords" attribute="Keyword" context="#stay"/>
+        <RegExpr String="[a-z][a-zA-Z0-9_]*(?=\s*:)" attribute="Key" context="#stay"/>
+        <DetectChar char="&quot;" attribute="String" context="String"/>
+        <DetectChar char="'" attribute="String" context="RawString"/>
+      </context>
+      <context name="ProcessName" attribute="Function" lineEndContext="#pop">
+        <DetectChar char="#" attribute="Comment" context="Comment"/>
+      </context>
+      <context name="IncludePath" attribute="Path" lineEndContext="#pop">
+        <DetectChar char="#" attribute="Comment" context="Comment"/>
+      </context>
+      <context name="Comment" attribute="Comment" lineEndContext="#pop"/>
+      <context name="String" attribute="String" lineEndContext="#pop">
+        <RegExpr String="%\(\s*[a-z][a-zA-Z0-9_]*\s*\)" attribute="Variable" context="#stay"/>
+        <DetectChar char="&quot;" attribute="String" context="#pop"/>
+      </context>
+      <context name="RawString" attribute="String" lineEndContext="#pop">
+        <DetectChar char="'" attribute="String" context="#pop"/>
+      </context>
+    </contexts>
+    <itemDatas>
+      <itemData name="Normal Text" defStyleNum="dsNormal"/>
+      <itemData name="Keyword" defStyleNum="dsKeyword"/>
+      <itemData name="Function" defStyleNum="dsFunction"/>
+      <itemData name="Key" defStyleNum="dsAttribute"/>
+      <itemData name="String" defStyleNum="dsString"/>
+      <itemData name="Variable" defStyleNum="dsVariable"/>
+      <itemData name="Path" defStyleNum="dsImport"/>
+      <itemData name="Comment" defStyleNum="dsComment"/>
+    </itemDatas>
+  </highlighting>
+  <general>
+    <comments>
+      <comment name="singleLine" start="#"/>
+    </comments>
+    <keywords casesensitive="1"/>
+  </general>
+</language>

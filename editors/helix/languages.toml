@@ -1,0 +1,25 @@
+# foobar for Helix. Append to ~/.config/helix/languages.toml, then fetch and build the grammar and
+# link its queries:
+#   hx --grammar fetch && hx --grammar build
+#   mkdir -p ~/.config/helix/runtime/queries
+#   ln -s ~/.config/helix/runtime/grammars/sources/foobar/queries ~/.config/helix/runtime/queries/foobar
+# `foobar` must be on PATH (`cargo install --path .` in foobar-language-server).
+
+[[language]]
+name = "foobar"
+scope = "source.foobar"
+file-types = ["foobar"]
+roots = [".git"]
+comment-token = "#"
+indent = { tab-width = 2, unit = "  " }
+language-servers = ["foobar"]
+# Formatting goes through the language server (Topiary rules from tree-sitter-foobar).
+auto-format = true
+
+[language-server.foobar]
+command = "foobar"
+args = ["lsp"]
+
+[[grammar]]
+name = "foobar"
+source = { git = "https://github.com/tfachmann/tree-sitter-foobar", rev = "70584d3a92702bedbf2196887a60629841f850ad" }

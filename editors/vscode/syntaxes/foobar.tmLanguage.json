@@ -1,0 +1,95 @@
+{
+  "$comment": "VS Code does not use tree-sitter: this restates tree-sitter-foobar/queries/highlights.scm as a TextMate grammar.",
+  "name": "foobar",
+  "scopeName": "source.foobar",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#process" },
+    { "include": "#template" },
+    { "include": "#include" },
+    { "include": "#use" },
+    { "include": "#keyword" },
+    { "include": "#key" },
+    { "include": "#string" },
+    { "include": "#raw-string" }
+  ],
+  "repository": {
+    "comment": {
+      "match": "#.*$",
+      "name": "comment.line.number-sign.foobar"
+    },
+    "process": {
+      "match": "^\\s*(process)[ \\t]+([^#\\n]*?)\\s*(?=#|$)",
+      "captures": {
+        "1": { "name": "keyword.control.foobar" },
+        "2": { "name": "entity.name.function.foobar" }
+      }
+    },
+    "template": {
+      "match": "^\\s*(template)[ \\t]+([a-z][a-zA-Z0-9_]*)\\s*\\(([^)]*)\\)",
+      "captures": {
+        "1": { "name": "keyword.control.foobar" },
+        "2": { "name": "entity.name.function.foobar" },
+        "3": { "name": "variable.parameter.foobar" }
+      }
+    },
+    "include": {
+      "match": "^\\s*(include)[ \\t]+(\\S+)",
+      "captures": {
+        "1": { "name": "keyword.control.import.foobar" },
+        "2": { "name": "string.unquoted.path.foobar" }
+      }
+    },
+    "use": {
+      "begin": "^\\s*(use)[ \\t]+([a-z][a-zA-Z0-9_]*)\\s*(\\()",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.foobar" },
+        "2": { "name": "entity.name.function.call.foobar" },
+        "3": { "name": "punctuation.bracket.foobar" }
+      },
+      "end": "\\)",
+      "endCaptures": {
+        "0": { "name": "punctuation.bracket.foobar" }
+      },
+      "patterns": [
+        {
+          "match": "([a-z][a-zA-Z0-9_]*)\\s*(:)",
+          "captures": {
+            "1": { "name": "variable.parameter.foobar" },
+            "2": { "name": "punctuation.separator.key-value.foobar" }
+          }
+        },
+        { "include": "#string" },
+        { "include": "#raw-string" }
+      ]
+    },
+    "keyword": {
+      "match": "^\\s*(defines)\\b",
+      "captures": {
+        "1": { "name": "keyword.control.foobar" }
+      }
+    },
+    "key": {
+      "match": "^\\s*([a-z][a-zA-Z0-9_]*)\\s*(:)",
+      "captures": {
+        "1": { "name": "variable.other.property.foobar" },
+        "2": { "name": "punctuation.separator.key-value.foobar" }
+      }
+    },
+    "string": {
+      "begin": "\"",
+      "end": "\"|$",
+      "name": "string.quoted.double.foobar",
+      "patterns": [
+        {
+          "match": "%\\(\\s*[a-z][a-zA-Z0-9_]*\\s*\\)",
+          "name": "variable.other.foobar"
+        }
+      ]
+    },
+    "raw-string": {
+      "match": "'[^'\\n]*'",
+      "name": "string.quoted.single.foobar"
+    }
+  }
+}
