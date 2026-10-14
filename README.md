@@ -66,3 +66,7 @@ Setup for Neovim, Helix, Emacs, Kate, Zed and VS Code: [`editors/`](editors/READ
 [ariadne](https://crates.io/crates/ariadne)
 
 The first draft was inspired and guided by [terror/just-lsp](https://github.com/terror/just-lsp).
+
+## License
+
+[MIT](LICENSE)
