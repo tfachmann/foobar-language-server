@@ -18,7 +18,7 @@ tokio = { version = "1", features = [
   "time",
 ] }
 tree-sitter = "0.26"
-tree-sitter-foobar = { path = "../tree-sitter-foobar" }
+tree-sitter-foobar = { git = "https://github.com/tfachmann/tree-sitter-foobar" }
 # Formats with `tree_sitter_foobar::FORMATTING_QUERY`; pins tree-sitter to an exact version.
 topiary-core = "0.8"
 topiary-tree-sitter-facade = "0.8"

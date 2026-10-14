@@ -11,9 +11,10 @@ use tokio::task::JoinHandle;
 use tower_lsp_server::jsonrpc::Result as RpcResult;
 use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf, Position,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams, FoldingRange,
+    FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
+    InitializeResult, InitializedParams, Location, MessageType, OneOf, Position,
     PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams, ServerCapabilities,
     ServerInfo, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
     TextEdit, Uri, WorkDoneProgressOptions, WorkspaceEdit,
@@ -25,6 +26,7 @@ use crate::completion;
 use crate::definition;
 use crate::diagnostics;
 use crate::document::Document;
+use crate::folding;
 use crate::format::Formatter;
 use crate::hover;
 use crate::references;
@@ -171,6 +173,7 @@ impl LanguageServer for Backend {
                     trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
                     ..CompletionOptions::default()
                 }),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -355,6 +358,16 @@ impl LanguageServer for Backend {
             &*doc.read().await,
             &params,
         ))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> RpcResult<Option<Vec<FoldingRange>>> {
+        let Some(doc) = self.doc(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        Ok(Some(folding::ranges(&*doc.read().await)))
     }
 
     async fn goto_definition(

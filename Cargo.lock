@@ -1151,6 +1151,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-foobar"
 version = "0.1.0"
+source = "git+https://github.com/tfachmann/tree-sitter-foobar#70584d3a92702bedbf2196887a60629841f850ad"
 dependencies = [
  "cc",
  "serde_json",
